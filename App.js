@@ -128,6 +128,63 @@ function formatTimeForDisplay(timeText) {
   return `${ampmLabel} ${pad2(hour12)}:${pad2(minute)}`
 }
 
+function buildCombinedMemoText(windows, rightMemos) {
+  const items = (windows ?? []).filter((w) => w && w.id !== "all")
+  const lines = []
+  let prevHadBody = false
+  for (const w of items) {
+    const body = String(rightMemos?.[w.id] ?? "").trimEnd()
+    if (prevHadBody) lines.push("")
+    lines.push(`[${w.title}]`)
+    if (body) {
+      lines.push(body)
+      prevHadBody = true
+    } else {
+      prevHadBody = false
+    }
+  }
+  return lines.join("\n").trimEnd()
+}
+
+function splitCombinedMemoText(text, windows) {
+  const items = (windows ?? []).filter((w) => w && w.id !== "all")
+  const titleToId = new Map(items.map((w) => [String(w.title ?? ""), String(w.id ?? "")]))
+  const windowLinesById = new Map(items.map((w) => [String(w.id ?? ""), []]))
+  let currentSection = ""
+
+  const lines = String(text ?? "").split("\n")
+  for (const rawLine of lines) {
+    const headerMatch = rawLine.match(/^\s*\[(.+)\](.*)$/)
+    if (headerMatch) {
+      const title = String(headerMatch[1] ?? "")
+      const id = titleToId.get(title)
+      if (id) {
+        currentSection = id
+        const rest = String(headerMatch[2] ?? "").replace(/^\s+/, "")
+        if (rest) {
+          const bucket = windowLinesById.get(id) ?? []
+          bucket.push(rest)
+          windowLinesById.set(id, bucket)
+        }
+        continue
+      }
+    }
+
+    if (!currentSection) continue
+    const bucket = windowLinesById.get(currentSection) ?? []
+    bucket.push(rawLine)
+    windowLinesById.set(currentSection, bucket)
+  }
+
+  const windowTexts = {}
+  for (const w of items) {
+    const id = String(w.id ?? "")
+    if (!id) continue
+    windowTexts[id] = (windowLinesById.get(id) ?? []).join("\n").trimEnd()
+  }
+  return { windowTexts }
+}
+
 function formatLine(item) {
   const time = item?.time ? String(item.time).trim() : ""
   const text = String(item?.content ?? "").trim()
@@ -777,18 +834,35 @@ function MemoScreen({
   const draftRef = useRef("")
   const dirtyRef = useRef(false)
   const prevTabRef = useRef(activeTabId)
+  const lastAppliedTabRef = useRef(activeTabId)
   const saveTimerRef = useRef(null)
   const saveSeqRef = useRef(0)
+
+  async function saveForTab(tabId, text) {
+    if (!tabId || tabId === "all") return
+    await onSaveMemo?.(tabId, text)
+  }
+
+  async function saveForAll(text) {
+    const { windowTexts } = splitCombinedMemoText(text, windows)
+    const targets = (windows ?? []).filter((w) => w && w.id !== "all")
+    for (const w of targets) {
+      const id = String(w.id ?? "")
+      if (!id) continue
+      await onSaveMemo?.(id, windowTexts?.[id] ?? "")
+    }
+  }
 
   useEffect(() => {
     const prevId = prevTabRef.current
     prevTabRef.current = activeTabId
+    const tabChanged = prevId !== activeTabId
 
-    if (prevId && prevId !== "all" && dirtyRef.current) {
+    if (prevId && dirtyRef.current && tabChanged) {
       const contentToSave = draftRef.current
       saveSeqRef.current += 1
       const seq = saveSeqRef.current
-      Promise.resolve(onSaveMemo?.(prevId, contentToSave)).catch((_e) => {
+      Promise.resolve(prevId === "all" ? saveForAll(contentToSave) : saveForTab(prevId, contentToSave)).catch((_e) => {
         // ignore (we surface errors inside onSaveMemo)
       }).finally(() => {
         if (saveSeqRef.current === seq) {
@@ -803,27 +877,22 @@ function MemoScreen({
       saveTimerRef.current = null
     }
 
-    if (activeTabId === "all") {
-      draftRef.current = ""
-      dirtyRef.current = false
-      setDraft("")
-      setDirty(false)
-      return
-    }
-
     const nextText = String(memoText ?? "")
-    draftRef.current = nextText
-    dirtyRef.current = false
-    setDraft(nextText)
-    setDirty(false)
+    if (tabChanged || !dirtyRef.current || lastAppliedTabRef.current !== activeTabId) {
+      lastAppliedTabRef.current = activeTabId
+      draftRef.current = nextText
+      dirtyRef.current = false
+      setDraft(nextText)
+      setDirty(false)
+    }
   }, [activeTabId, memoText])
 
   useEffect(() => {
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
       const prevId = prevTabRef.current
-      if (prevId && prevId !== "all" && dirtyRef.current) {
-        Promise.resolve(onSaveMemo?.(prevId, draftRef.current)).catch((_e) => {
+      if (prevId && dirtyRef.current) {
+        Promise.resolve(prevId === "all" ? saveForAll(draftRef.current) : saveForTab(prevId, draftRef.current)).catch((_e) => {
           // ignore
         })
       }
@@ -853,7 +922,7 @@ function MemoScreen({
       />
       <View style={[styles.card, styles.memoCard]}>
         {loading ? <ActivityIndicator size="small" color="#3b82f6" /> : null}
-        {activeTabId === "all" ? (
+        {false ? (
           <ScrollView contentContainerStyle={styles.memoAllList}>
             {(windows ?? [])
               .filter((w) => w && w.id !== "all")
@@ -877,7 +946,7 @@ function MemoScreen({
         ) : (
           <View style={styles.memoEditorWrap}>
             <View style={styles.memoEditorBar}>
-              <Text style={styles.memoEditorTitle}>메모</Text>
+              <Text style={styles.memoEditorTitle}>{activeTabId === "all" ? "통합 메모" : "메모"}</Text>
             </View>
             <TextInput
               value={draft}
@@ -890,11 +959,10 @@ function MemoScreen({
 
                 if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
                 saveTimerRef.current = setTimeout(() => {
-                  if (activeTabId === "all") return
                   const contentToSave = draftRef.current
                   saveSeqRef.current += 1
                   const seq = saveSeqRef.current
-                  Promise.resolve(onSaveMemo?.(activeTabId, contentToSave))
+                  Promise.resolve(activeTabId === "all" ? saveForAll(contentToSave) : saveForTab(activeTabId, contentToSave))
                     .catch((_e) => {
                       // ignore
                     })
@@ -905,7 +973,7 @@ function MemoScreen({
                     })
                 }, 700)
               }}
-              placeholder="메모를 입력하세요"
+              placeholder={activeTabId === "all" ? "[탭명] 아래에 메모를 입력하세요" : "메모를 입력하세요"}
               multiline
               textAlignVertical="top"
               style={styles.memoInput}
@@ -2080,14 +2148,7 @@ function AppInner() {
 
   const memoText = useMemo(() => {
     if (activeTabId !== "all") return rightMemos[activeTabId] ?? ""
-    const chunks = []
-    for (const w of windows) {
-      if (w.id === "all") continue
-      const content = String(rightMemos[w.id] ?? "").trim()
-      if (content) chunks.push(`[${w.title}]\n${content}`)
-      else chunks.push(`[${w.title}]`)
-    }
-    return chunks.join("\n\n")
+    return buildCombinedMemoText(windows, rightMemos)
   }, [rightMemos, activeTabId, windows])
 
   if (!supabase) {
