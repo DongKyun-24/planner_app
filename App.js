@@ -2,8 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import Constants from "expo-constants"
 import AsyncStorage from "@react-native-async-storage/async-storage"
 import { createClient } from "@supabase/supabase-js"
+import DateTimePicker from "@react-native-community/datetimepicker"
 import {
   ActivityIndicator,
+  Alert,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -20,6 +22,29 @@ import {
 import { NavigationContainer } from "@react-navigation/native"
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs"
 import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context"
+
+const ACCENT_BLUE = "#2b67c7"
+const ACCENT_RED = "#d04b4b"
+const WINDOW_COLORS = [
+  "#c40000",
+  "#ff7a00",
+  "#ff4a00",
+  "#ffe94a",
+  "#ffd21a",
+  "#dff08a",
+  "#86e000",
+  "#0b7a0b",
+  "#0a5a1f",
+  "#7fe8d2",
+  "#98ddff",
+  "#cfe0ff",
+  "#14a7d8",
+  "#1f33d6",
+  "#1b0f7d",
+  "#6b2e8f",
+  "#e1c2ff",
+  "#ffd1e7"
+]
 
 const supabaseUrl =
   Constants.expoConfig?.extra?.supabaseUrl || process.env.EXPO_PUBLIC_SUPABASE_URL || ""
@@ -40,8 +65,9 @@ const supabase =
 
 const Tab = createBottomTabNavigator()
 
-const DEFAULT_WINDOWS = [{ id: "all", title: "통합", color: "#1d4ed8", fixed: true }]
+const DEFAULT_WINDOWS = [{ id: "all", title: "통합", color: ACCENT_BLUE, fixed: true }]
 const AUTH_STORAGE_KEY = "plannerMobile.auth.v1"
+const CLIENT_ID_KEY = "plannerMobile.clientId.v1"
 
 function pad2(value) {
   return String(value).padStart(2, "0")
@@ -67,13 +93,39 @@ function weekdayLabel(dateKey) {
 }
 
 function weekdayColor(dateKey, { isHoliday } = {}) {
-  if (isHoliday) return "#dc2626"
+  if (isHoliday) return ACCENT_RED
   const dt = parseDateKey(dateKey)
   if (!dt) return "#0f172a"
   const dow = dt.getDay()
-  if (dow === 0) return "#dc2626"
-  if (dow === 6) return "#2563eb"
+  if (dow === 0) return ACCENT_RED
+  if (dow === 6) return ACCENT_BLUE
   return "#0f172a"
+}
+
+function formatDateMD(dateKey) {
+  const dt = parseDateKey(dateKey)
+  if (!dt) return String(dateKey ?? "")
+  return `${dt.getMonth() + 1}/${dt.getDate()}`
+}
+
+function genClientId() {
+  const rand = Math.random().toString(16).slice(2)
+  return `mobile-${Date.now().toString(16)}-${rand}`
+}
+
+function formatTimeHHMM(dateValue) {
+  if (!(dateValue instanceof Date) || Number.isNaN(dateValue.getTime())) return ""
+  return `${pad2(dateValue.getHours())}:${pad2(dateValue.getMinutes())}`
+}
+
+function formatTimeForDisplay(timeText) {
+  const match = String(timeText ?? "").trim().match(/^(\d{1,2}):(\d{2})$/)
+  if (!match) return ""
+  const hour24 = Math.min(23, Math.max(0, Number(match[1])))
+  const minute = Math.min(59, Math.max(0, Number(match[2])))
+  const ampmLabel = hour24 >= 12 ? "오후" : "오전"
+  const hour12 = hour24 % 12 === 0 ? 12 : hour24 % 12
+  return `${ampmLabel} ${pad2(hour12)}:${pad2(minute)}`
 }
 
 function formatLine(item) {
@@ -133,15 +185,28 @@ function Header({
             style={[styles.ghostButton, isDark ? styles.ghostButtonDark : null]}
             onPress={onRefresh}
             disabled={loading}
+            accessibilityRole="button"
+            accessibilityLabel={loading ? "Refreshing" : "Refresh"}
           >
-            <Text style={[styles.ghostButtonText, isDark ? styles.ghostButtonTextDark : null]}>
-              {loading ? "Refreshing..." : "Refresh"}
+            <Text
+              style={[
+                styles.ghostButtonText,
+                isDark ? styles.ghostButtonTextDark : null,
+                loading ? styles.ghostButtonTextDisabled : null
+              ]}
+            >
+              ⟳
             </Text>
           </TouchableOpacity>
         ) : null}
         {onSignOut ? (
-          <TouchableOpacity style={[styles.ghostButton, isDark ? styles.ghostButtonDark : null]} onPress={onSignOut}>
-            <Text style={[styles.ghostButtonText, isDark ? styles.ghostButtonTextDark : null]}>Sign out</Text>
+          <TouchableOpacity
+            style={[styles.ghostButton, isDark ? styles.ghostButtonDark : null]}
+            onPress={onSignOut}
+            accessibilityRole="button"
+            accessibilityLabel="Sign out"
+          >
+            <Text style={[styles.ghostButtonText, isDark ? styles.ghostButtonTextDark : null]}>⎋</Text>
           </TouchableOpacity>
         ) : null}
       </View>
@@ -149,43 +214,295 @@ function Header({
   )
 }
 
-function WindowTabs({ windows, activeId, onSelect, tone = "light" }) {
+function WindowTabs({
+  windows,
+  activeId,
+  onSelect,
+  onAddWindow,
+  onRenameWindow,
+  onDeleteWindow,
+  onChangeWindowColor,
+  tone = "light"
+}) {
   const isDark = tone === "dark"
+  const [menuWindow, setMenuWindow] = useState(null)
+  const [menuVisible, setMenuVisible] = useState(false)
+  const [addVisible, setAddVisible] = useState(false)
+  const [renameVisible, setRenameVisible] = useState(false)
+  const [colorVisible, setColorVisible] = useState(false)
+  const [draftTitle, setDraftTitle] = useState("")
+  const [draftColor, setDraftColor] = useState(ACCENT_BLUE)
+
+  const palette = useMemo(
+    () => WINDOW_COLORS,
+    []
+  )
+
+  const nextDefaultColor = useMemo(() => {
+    const used = new Set((windows ?? []).map((w) => String(w?.color ?? "").toLowerCase()).filter(Boolean))
+    const available = palette.find((c) => !used.has(String(c).toLowerCase()))
+    return available ?? palette[(windows?.length ?? 1) % palette.length] ?? palette[0]
+  }, [palette, windows])
+
+  function closeAll() {
+    setMenuVisible(false)
+    setAddVisible(false)
+    setRenameVisible(false)
+    setColorVisible(false)
+  }
+
+  function openAdd() {
+    setMenuWindow(null)
+    setDraftTitle("")
+    setDraftColor(nextDefaultColor)
+    setAddVisible(true)
+  }
+
+  function openMenu(windowItem) {
+    if (!windowItem || windowItem.id === "all") return
+    setMenuWindow(windowItem)
+    setMenuVisible(true)
+  }
+
+  function openRename() {
+    if (!menuWindow) return
+    setDraftTitle(String(menuWindow.title ?? ""))
+    setMenuVisible(false)
+    setRenameVisible(true)
+  }
+
+  function openColors() {
+    if (!menuWindow) return
+    setMenuVisible(false)
+    setColorVisible(true)
+  }
+
+  function requestDelete() {
+    if (!menuWindow) return
+    const title = String(menuWindow.title ?? "")
+    setMenuVisible(false)
+    Alert.alert("삭제", `"${title}" 탭을 삭제할까요?\n(해당 탭 일정은 삭제됩니다)` , [
+      { text: "취소", style: "cancel" },
+      {
+        text: "삭제",
+        style: "destructive",
+        onPress: async () => {
+          await onDeleteWindow?.(menuWindow)
+          closeAll()
+        }
+      }
+    ])
+  }
+
   return (
     <View style={[styles.tabBarWrap, isDark ? styles.tabBarWrapDark : null]}>
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        style={[styles.tabScroll, isDark ? styles.tabScrollDark : null]}
-        contentContainerStyle={[styles.tabRow, isDark ? styles.tabRowDark : null]}
-      >
-        {windows.map((w) => {
-          const active = w.id === activeId
-          const label = w.id === "all" ? "\uD1B5\uD569" : w.title
-          return (
-            <TouchableOpacity
-              key={w.id}
-              style={[
-                styles.tabPill,
-                isDark ? styles.tabPillDark : null,
-                active ? (isDark ? styles.tabPillActiveDark : styles.tabPillActive) : null
-              ]}
-              onPress={() => onSelect(w.id)}
-            >
-              {w.id !== "all" ? (
-                <View style={[styles.tabDot, { backgroundColor: w.color || "#3b82f6" }]} />
-              ) : null}
-              <Text style={[
-                styles.tabText,
-                isDark ? styles.tabTextDark : null,
-                active ? (isDark ? styles.tabTextActiveDark : styles.tabTextActive) : null
-              ]}>
-                {label}
-              </Text>
-            </TouchableOpacity>
-          )
-        })}
-      </ScrollView>
+      <View style={styles.tabBarInner}>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={[styles.tabScroll, isDark ? styles.tabScrollDark : null]}
+          contentContainerStyle={[
+            styles.tabRow,
+            isDark ? styles.tabRowDark : null,
+            { paddingRight: 64 }
+          ]}
+        >
+          {windows.map((w) => {
+            const active = w.id === activeId
+            const label = w.id === "all" ? "통합" : w.title
+            return (
+              <TouchableOpacity
+                key={w.id}
+                style={[
+                  styles.tabPill,
+                  isDark ? styles.tabPillDark : null,
+                  active ? (isDark ? styles.tabPillActiveDark : styles.tabPillActive) : null
+                ]}
+                onPress={() => onSelect(w.id)}
+                activeOpacity={0.9}
+              >
+                {w.id !== "all" ? (
+                  <View style={[styles.tabDot, { backgroundColor: w.color || "#3b82f6" }]} />
+                ) : null}
+                <Text
+                  style={[
+                    styles.tabText,
+                    isDark ? styles.tabTextDark : null,
+                    active ? (isDark ? styles.tabTextActiveDark : styles.tabTextActive) : null
+                  ]}
+                  numberOfLines={1}
+                >
+                  {label}
+                </Text>
+                {w.id !== "all" ? (
+                  <Pressable
+                    onPress={(e) => {
+                      e?.stopPropagation?.()
+                      openMenu(w)
+                    }}
+                    hitSlop={10}
+                    style={styles.tabMenuBtn}
+                  >
+                    <Text style={styles.tabMenuIcon}>⋮</Text>
+                  </Pressable>
+                ) : null}
+              </TouchableOpacity>
+            )
+          })}
+        </ScrollView>
+
+        <Pressable onPress={openAdd} style={styles.tabAddBtn} hitSlop={10}>
+          <Text style={styles.tabAddText}>＋</Text>
+        </Pressable>
+      </View>
+
+      <Modal transparent animationType="fade" visible={addVisible} statusBarTranslucent>
+        <View style={styles.sheetOverlay}>
+          <Pressable style={styles.sheetBackdrop} onPress={closeAll} />
+          <View style={styles.sheetCard}>
+            <View style={styles.sheetHeader}>
+              <Text style={styles.sheetTitle}>새 탭</Text>
+              <View style={styles.sheetHeaderRight}>
+                <Pressable onPress={closeAll} style={styles.sheetBtnGhost}>
+                  <Text style={styles.sheetBtnGhostText}>취소</Text>
+                </Pressable>
+                <Pressable
+                  onPress={async () => {
+                    const next = String(draftTitle ?? "").trim()
+                    if (!next) return
+                    await onAddWindow?.(next, draftColor)
+                    closeAll()
+                  }}
+                  style={styles.sheetBtnPrimary}
+                >
+                  <Text style={styles.sheetBtnPrimaryText}>추가</Text>
+                </Pressable>
+              </View>
+            </View>
+
+            <TextInput
+              value={draftTitle}
+              onChangeText={setDraftTitle}
+              placeholder="예: 금융"
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={styles.menuInput}
+              maxLength={20}
+            />
+
+            <Text style={styles.menuHint}>색을 고르고 탭 이름을 입력하세요.</Text>
+            <View style={styles.colorGrid}>
+              {palette.map((color) => {
+                const active = color === draftColor
+                return (
+                  <Pressable
+                    key={color}
+                    onPress={() => setDraftColor(color)}
+                    style={[styles.colorSwatch, { backgroundColor: color }, active ? styles.colorSwatchActive : null]}
+                  />
+                )
+              })}
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal transparent animationType="fade" visible={menuVisible} statusBarTranslucent>
+        <View style={styles.sheetOverlay}>
+          <Pressable style={styles.sheetBackdrop} onPress={closeAll} />
+          <View style={styles.sheetCard}>
+            <View style={styles.sheetHeader}>
+              <Text style={styles.sheetTitle}>{menuWindow?.title || "탭"}</Text>
+              <View style={styles.sheetHeaderRight}>
+                <Pressable onPress={closeAll} style={styles.sheetBtnGhost}>
+                  <Text style={styles.sheetBtnGhostText}>닫기</Text>
+                </Pressable>
+              </View>
+            </View>
+            <View style={styles.menuList}>
+              <Pressable style={styles.menuItem} onPress={openColors}>
+                <Text style={styles.menuItemText}>색깔 변경</Text>
+              </Pressable>
+              <Pressable style={styles.menuItem} onPress={openRename}>
+                <Text style={styles.menuItemText}>이름 수정</Text>
+              </Pressable>
+              <Pressable style={[styles.menuItem, styles.menuItemDanger]} onPress={requestDelete}>
+                <Text style={[styles.menuItemText, styles.menuItemTextDanger]}>삭제</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal transparent animationType="fade" visible={renameVisible} statusBarTranslucent>
+        <View style={styles.sheetOverlay}>
+          <Pressable style={styles.sheetBackdrop} onPress={closeAll} />
+          <View style={styles.sheetCard}>
+            <View style={styles.sheetHeader}>
+              <Text style={styles.sheetTitle}>탭 이름</Text>
+              <View style={styles.sheetHeaderRight}>
+                <Pressable onPress={closeAll} style={styles.sheetBtnGhost}>
+                  <Text style={styles.sheetBtnGhostText}>취소</Text>
+                </Pressable>
+                <Pressable
+                  onPress={async () => {
+                    const next = String(draftTitle ?? "").trim()
+                    if (!menuWindow) return
+                    if (!next) return
+                    await onRenameWindow?.(menuWindow, next)
+                    closeAll()
+                  }}
+                  style={styles.sheetBtnPrimary}
+                >
+                  <Text style={styles.sheetBtnPrimaryText}>저장</Text>
+                </Pressable>
+              </View>
+            </View>
+            <TextInput
+              value={draftTitle}
+              onChangeText={setDraftTitle}
+              placeholder="예: 금융"
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={styles.menuInput}
+              maxLength={20}
+            />
+            <Text style={styles.menuHint}>통합 탭은 수정/삭제할 수 없어요.</Text>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal transparent animationType="fade" visible={colorVisible} statusBarTranslucent>
+        <View style={styles.sheetOverlay}>
+          <Pressable style={styles.sheetBackdrop} onPress={closeAll} />
+          <View style={styles.sheetCard}>
+            <View style={styles.sheetHeader}>
+              <Text style={styles.sheetTitle}>색깔 변경</Text>
+              <View style={styles.sheetHeaderRight}>
+                <Pressable onPress={closeAll} style={styles.sheetBtnGhost}>
+                  <Text style={styles.sheetBtnGhostText}>닫기</Text>
+                </Pressable>
+              </View>
+            </View>
+            <View style={styles.colorGrid}>
+              {palette.map((color) => {
+                const active = color === menuWindow?.color
+                return (
+                  <Pressable
+                    key={color}
+                    onPress={async () => {
+                      if (!menuWindow) return
+                      await onChangeWindowColor?.(menuWindow, color)
+                      closeAll()
+                    }}
+                    style={[styles.colorSwatch, { backgroundColor: color }, active ? styles.colorSwatchActive : null]}
+                  />
+                )
+              })}
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   )
 }
@@ -198,8 +515,14 @@ function ListScreen({
   windows,
   activeTabId,
   onSelectTab,
+  onAddWindow,
+  onRenameWindow,
+  onDeleteWindow,
+  onChangeWindowColor,
   holidaysByDate,
-  ensureHolidayYear
+  ensureHolidayYear,
+  onAddPlan,
+  onEditPlan
 }) {
   const today = new Date()
   const [viewYear, setViewYear] = useState(today.getFullYear())
@@ -209,6 +532,15 @@ function ListScreen({
   const listRef = useRef(null)
   const pendingScrollRef = useRef(false)
   const [scrollToken, setScrollToken] = useState(0)
+
+  const colorByTitle = useMemo(() => {
+    const map = new Map()
+    for (const w of windows ?? []) {
+      if (!w?.title) continue
+      map.set(String(w.title), w.color || "#94a3b8")
+    }
+    return map
+  }, [windows])
 
   function scrollToToday() {
     const index = visibleSections.findIndex((s) => s.title === todayKey)
@@ -284,18 +616,41 @@ function ListScreen({
         titleStyle={styles.calendarTitleOffset}
         buttonsStyle={styles.calendarButtonsOffset}
       />
-      <WindowTabs windows={windows} activeId={activeTabId} onSelect={onSelectTab} tone="light" />
+      <WindowTabs
+        windows={windows}
+        activeId={activeTabId}
+        onSelect={onSelectTab}
+        onAddWindow={onAddWindow}
+        onRenameWindow={onRenameWindow}
+        onDeleteWindow={onDeleteWindow}
+        onChangeWindowColor={onChangeWindowColor}
+        tone="light"
+      />
       <View style={styles.listMonthBar}>
-        <TouchableOpacity style={[styles.calendarNavButton, styles.listMonthLeft]} onPress={goPrevMonth}>
-          <Text style={styles.calendarNavText}>{"<"}</Text>
-        </TouchableOpacity>
-        <Text style={styles.listMonthTextCentered}>{monthLabel}</Text>
-        <View style={styles.listMonthRight}>
+        <View style={styles.listMonthLeftGroup}>
+          <TouchableOpacity style={styles.listMonthNavButton} onPress={goPrevMonth}>
+            <Text style={styles.listMonthNavText}>{"‹"}</Text>
+          </TouchableOpacity>
+          <Text style={styles.listMonthText}>{monthLabel}</Text>
+          <TouchableOpacity style={styles.listMonthNavButton} onPress={goNextMonth}>
+            <Text style={styles.listMonthNavText}>{"›"}</Text>
+          </TouchableOpacity>
+        </View>
+        <View style={styles.listMonthRightGroup}>
+          <TouchableOpacity
+            style={styles.listAddButton}
+            onPress={() => {
+              const key =
+                viewYear === today.getFullYear() && viewMonth === today.getMonth() + 1
+                  ? todayKey
+                  : dateToKey(viewYear, viewMonth, 1)
+              onAddPlan?.(key)
+            }}
+          >
+            <Text style={styles.listAddText}>+ Add</Text>
+          </TouchableOpacity>
           <TouchableOpacity style={styles.listTodayButton} onPress={goToday}>
             <Text style={styles.listTodayText}>Today</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.calendarNavButton} onPress={goNextMonth}>
-            <Text style={styles.calendarNavText}>{">"}</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -307,12 +662,32 @@ function ListScreen({
           keyExtractor={(item) => item.id ?? `${item.date}-${item.content}`}
           stickySectionHeadersEnabled={false}
           renderItem={({ item }) => {
-            const { time, text } = formatLine(item)
+            const time = item?.time ? String(item.time).trim() : ""
+            const content = String(item?.content ?? "").trim()
+            const category = String(item?.category_id ?? "").trim()
+            const isGeneral = !category || category === "__general__"
+            const categoryColor = colorByTitle.get(category) || "#94a3b8"
             return (
-              <View style={styles.itemRow}>
-                <Text style={time ? styles.itemTime : styles.itemTimeEmpty}>{time || "\u00A0"}</Text>
-                <Text style={styles.itemText}>{text}</Text>
-              </View>
+              <Pressable style={styles.itemRow} onPress={() => onEditPlan?.(item)}>
+                <View style={styles.itemLeftCol}>
+                  <Text style={time ? styles.itemTimeText : styles.itemTimeTextEmpty}>{time || "\u00A0"}</Text>
+                </View>
+                <View style={styles.itemMainCol}>
+                  <View style={styles.itemTopRow}>
+                    <Text style={styles.itemTitle} numberOfLines={1}>
+                      {content}
+                    </Text>
+                    {!isGeneral ? (
+                      <View style={styles.itemCategoryBadge}>
+                        <View style={[styles.itemCategoryDot, { backgroundColor: categoryColor }]} />
+                        <Text style={styles.itemCategoryText} numberOfLines={1}>
+                          {category}
+                        </Text>
+                      </View>
+                    ) : null}
+                  </View>
+                </View>
+              </Pressable>
             )
           }}
           renderSectionHeader={({ section }) => {
@@ -322,10 +697,13 @@ function ListScreen({
             const color = weekdayColor(key, { isHoliday })
             const dow = weekdayLabel(key)
             return (
-              <View style={[styles.sectionHeader, section.title === todayKey ? styles.sectionHeaderToday : null]}>
+              <Pressable
+                style={[styles.sectionHeader, section.title === todayKey ? styles.sectionHeaderToday : null]}
+                onPress={() => onAddPlan?.(key)}
+              >
                 <View style={styles.sectionHeaderRow}>
                   <View style={styles.sectionHeaderLeft}>
-                    <Text style={[styles.sectionHeaderDateText, { color }]}>{key}</Text>
+                    <Text style={[styles.sectionHeaderDateText, { color }]}>{formatDateMD(key)}</Text>
                     {dow ? (
                       <View
                         style={[
@@ -358,7 +736,7 @@ function ListScreen({
                     ) : null}
                   </View>
                 </View>
-              </View>
+              </Pressable>
             )
           }}
           ListEmptyComponent={!loading ? <Text style={styles.helpText}>No items yet.</Text> : null}
@@ -379,7 +757,79 @@ function ListScreen({
   )
 }
 
-function MemoScreen({ memoText, loading, onRefresh, onSignOut, windows, activeTabId, onSelectTab }) {
+function MemoScreen({
+  memoText,
+  loading,
+  onRefresh,
+  onSignOut,
+  windows,
+  rightMemos,
+  activeTabId,
+  onSelectTab,
+  onAddWindow,
+  onRenameWindow,
+  onDeleteWindow,
+  onChangeWindowColor,
+  onSaveMemo
+}) {
+  const [draft, setDraft] = useState("")
+  const [dirty, setDirty] = useState(false)
+  const draftRef = useRef("")
+  const dirtyRef = useRef(false)
+  const prevTabRef = useRef(activeTabId)
+  const saveTimerRef = useRef(null)
+  const saveSeqRef = useRef(0)
+
+  useEffect(() => {
+    const prevId = prevTabRef.current
+    prevTabRef.current = activeTabId
+
+    if (prevId && prevId !== "all" && dirtyRef.current) {
+      const contentToSave = draftRef.current
+      saveSeqRef.current += 1
+      const seq = saveSeqRef.current
+      Promise.resolve(onSaveMemo?.(prevId, contentToSave)).catch((_e) => {
+        // ignore (we surface errors inside onSaveMemo)
+      }).finally(() => {
+        if (saveSeqRef.current === seq) {
+          dirtyRef.current = false
+          setDirty(false)
+        }
+      })
+    }
+
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current)
+      saveTimerRef.current = null
+    }
+
+    if (activeTabId === "all") {
+      draftRef.current = ""
+      dirtyRef.current = false
+      setDraft("")
+      setDirty(false)
+      return
+    }
+
+    const nextText = String(memoText ?? "")
+    draftRef.current = nextText
+    dirtyRef.current = false
+    setDraft(nextText)
+    setDirty(false)
+  }, [activeTabId, memoText])
+
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+      const prevId = prevTabRef.current
+      if (prevId && prevId !== "all" && dirtyRef.current) {
+        Promise.resolve(onSaveMemo?.(prevId, draftRef.current)).catch((_e) => {
+          // ignore
+        })
+      }
+    }
+  }, [onSaveMemo])
+
   return (
     <SafeAreaView style={[styles.container, styles.calendarFill]}>
       <Header
@@ -391,21 +841,358 @@ function MemoScreen({ memoText, loading, onRefresh, onSignOut, windows, activeTa
         titleStyle={styles.calendarTitleOffset}
         buttonsStyle={styles.calendarButtonsOffset}
       />
-      <WindowTabs windows={windows} activeId={activeTabId} onSelect={onSelectTab} tone="light" />
+      <WindowTabs
+        windows={windows}
+        activeId={activeTabId}
+        onSelect={onSelectTab}
+        onAddWindow={onAddWindow}
+        onRenameWindow={onRenameWindow}
+        onDeleteWindow={onDeleteWindow}
+        onChangeWindowColor={onChangeWindowColor}
+        tone="light"
+      />
       <View style={[styles.card, styles.memoCard]}>
         {loading ? <ActivityIndicator size="small" color="#3b82f6" /> : null}
-        <ScrollView contentContainerStyle={styles.memoContent}>
-          {memoText ? (
-            <Text style={styles.memoText}>{memoText}</Text>
-          ) : (
-            <View style={styles.memoEmpty}>
-              <Text style={styles.memoEmptyTitle}>메모가 없습니다</Text>
-              <Text style={styles.memoEmptySub}>오른쪽 메모에 내용을 작성해보세요.</Text>
+        {activeTabId === "all" ? (
+          <ScrollView contentContainerStyle={styles.memoAllList}>
+            {(windows ?? [])
+              .filter((w) => w && w.id !== "all")
+              .map((w) => {
+                const text = String(rightMemos?.[w.id] ?? "").trim()
+                return (
+                  <View key={w.id} style={styles.memoAllCard}>
+                    <View style={styles.memoAllHeader}>
+                      <View style={[styles.memoAllDot, { backgroundColor: w.color || "#94a3b8" }]} />
+                      <Text style={styles.memoAllTitle}>{w.title}</Text>
+                    </View>
+                    {text ? (
+                      <Text style={styles.memoAllBody}>{text}</Text>
+                    ) : (
+                      <Text style={styles.memoAllEmpty}>메모 없음</Text>
+                    )}
+                  </View>
+                )
+              })}
+          </ScrollView>
+        ) : (
+          <View style={styles.memoEditorWrap}>
+            <View style={styles.memoEditorBar}>
+              <Text style={styles.memoEditorTitle}>메모</Text>
             </View>
-          )}
-        </ScrollView>
+            <TextInput
+              value={draft}
+              onChangeText={(t) => {
+                const next = String(t ?? "")
+                draftRef.current = next
+                dirtyRef.current = true
+                setDraft(next)
+                if (!dirty) setDirty(true)
+
+                if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+                saveTimerRef.current = setTimeout(() => {
+                  if (activeTabId === "all") return
+                  const contentToSave = draftRef.current
+                  saveSeqRef.current += 1
+                  const seq = saveSeqRef.current
+                  Promise.resolve(onSaveMemo?.(activeTabId, contentToSave))
+                    .catch((_e) => {
+                      // ignore
+                    })
+                    .finally(() => {
+                      if (saveSeqRef.current !== seq) return
+                      dirtyRef.current = false
+                      setDirty(false)
+                    })
+                }, 700)
+              }}
+              placeholder="메모를 입력하세요"
+              multiline
+              textAlignVertical="top"
+              style={styles.memoInput}
+            />
+          </View>
+        )}
       </View>
     </SafeAreaView>
+  )
+}
+
+function PlanEditorModal({ visible, draft, windows, onClose, onSave, onDelete }) {
+  const [date, setDate] = useState("")
+  const [time, setTime] = useState("")
+  const [content, setContent] = useState("")
+  const [category, setCategory] = useState("__general__")
+  const [showDatePicker, setShowDatePicker] = useState(false)
+  const [showTimePicker, setShowTimePicker] = useState(false)
+  const [iosDateSheetVisible, setIosDateSheetVisible] = useState(false)
+  const [iosTempDate, setIosTempDate] = useState(new Date())
+  const [iosTimeSheetVisible, setIosTimeSheetVisible] = useState(false)
+  const [iosTempTime, setIosTempTime] = useState(new Date())
+
+  useEffect(() => {
+    if (!visible) return
+    setDate(String(draft?.date ?? ""))
+    setTime(String(draft?.time ?? ""))
+    setContent(String(draft?.content ?? ""))
+    setCategory(String(draft?.category_id ?? "__general__") || "__general__")
+    setShowDatePicker(false)
+    setShowTimePicker(false)
+    setIosDateSheetVisible(false)
+    setIosTimeSheetVisible(false)
+  }, [visible, draft])
+
+  const title = draft?.id ? "일정 수정" : "일정 추가"
+  const dateValue = useMemo(() => parseDateKey(date) ?? new Date(), [date])
+  const timeValue = useMemo(() => {
+    if (!time) return new Date()
+    const parts = String(time).split(":")
+    const h = Number(parts[0] ?? 0)
+    const m = Number(parts[1] ?? 0)
+    const next = new Date()
+    next.setHours(Number.isFinite(h) ? h : 0, Number.isFinite(m) ? m : 0, 0, 0)
+    return next
+  }, [time])
+  const timeDisplay = useMemo(() => (time ? formatTimeForDisplay(time) : ""), [time])
+
+  const options = useMemo(() => {
+    const items = [{ key: "__general__", label: "통합" }]
+    for (const w of windows ?? []) {
+      if (!w || w.id === "all") continue
+      items.push({ key: String(w.title), label: String(w.title), color: w.color || "#94a3b8" })
+    }
+    return items
+  }, [windows])
+
+  function handleSave() {
+    if (!date) return
+    if (!content.trim()) return
+    onSave?.({
+      ...(draft ?? {}),
+      date,
+      time: String(time ?? "").trim(),
+      content: String(content ?? "").trim(),
+      category_id: category
+    })
+  }
+
+  function confirmDelete() {
+    if (!draft?.id) return
+    Alert.alert("삭제", "이 일정을 삭제할까요?", [
+      { text: "취소", style: "cancel" },
+      { text: "삭제", style: "destructive", onPress: () => onDelete?.(draft.id) }
+    ])
+  }
+
+  return (
+    <Modal visible={visible} transparent presentationStyle="overFullScreen" statusBarTranslucent animationType="fade">
+      <View style={styles.dayModalOverlay}>
+        <Pressable style={styles.dayModalBackdrop} onPress={onClose} />
+        <View style={styles.editorCard}>
+          <View style={styles.editorHeader}>
+            <Text style={styles.editorTitle}>{title}</Text>
+            <Pressable onPress={onClose} style={styles.editorCloseBtn}>
+              <Text style={styles.editorCloseText}>닫기</Text>
+            </Pressable>
+          </View>
+
+          <View style={styles.editorMetaRow}>
+            <Text style={styles.editorMetaLabel}>날짜</Text>
+            <Pressable
+              style={styles.editorPickerRow}
+              onPress={() => {
+                if (Platform.OS === "ios") {
+                  setIosTempDate(dateValue)
+                  setIosDateSheetVisible(true)
+                  return
+                }
+                setShowDatePicker(true)
+              }}
+            >
+              <View style={styles.editorPickerLeft}>
+                <Text style={styles.editorPickerIcon}>📅</Text>
+                <Text style={styles.editorPickerValue}>
+                  {date} {weekdayLabel(date)}
+                </Text>
+              </View>
+              <Text style={styles.editorPickerHint}>변경</Text>
+            </Pressable>
+          </View>
+
+          <View style={styles.editorMetaRow}>
+            <Text style={styles.editorMetaLabel}>카테고리</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.editorCategoryRow}>
+              {options.map((opt) => {
+                const active = opt.key === category
+                return (
+                  <Pressable
+                    key={opt.key}
+                    onPress={() => setCategory(opt.key)}
+                    style={[styles.editorCategoryPill, active ? styles.editorCategoryPillActive : null]}
+                  >
+                    {opt.key !== "__general__" ? (
+                      <View style={[styles.tabDot, { backgroundColor: opt.color || "#94a3b8" }]} />
+                    ) : null}
+                    <Text style={[styles.editorCategoryText, active ? styles.editorCategoryTextActive : null]}>
+                      {opt.label}
+                    </Text>
+                  </Pressable>
+                )
+              })}
+            </ScrollView>
+          </View>
+
+          <View style={styles.editorMetaRow}>
+            <Text style={styles.editorMetaLabel}>시간</Text>
+            <Pressable
+              style={styles.editorPickerRow}
+              onPress={() => {
+                if (Platform.OS === "ios") {
+                  setIosTempTime(timeValue)
+                  setIosTimeSheetVisible(true)
+                  return
+                }
+                setShowTimePicker(true)
+              }}
+            >
+              <View style={styles.editorPickerLeft}>
+                <Text style={styles.editorPickerIcon}>⏰</Text>
+                <Text style={styles.editorPickerValue}>{time ? timeDisplay : "시간 선택 안함"}</Text>
+              </View>
+              <View style={styles.editorPickerRight}>
+                {time ? (
+                  <Pressable
+                    onPress={() => setTime("")}
+                    style={styles.editorPickerClearPill}
+                    hitSlop={8}
+                  >
+                    <Text style={styles.editorPickerClearText}>없음</Text>
+                  </Pressable>
+                ) : null}
+                <Text style={styles.editorPickerHint}>선택</Text>
+              </View>
+            </Pressable>
+          </View>
+
+          <View style={styles.editorMetaRow}>
+            <Text style={styles.editorMetaLabel}>내용</Text>
+            <TextInput
+              value={content}
+              onChangeText={setContent}
+              placeholder="할 일을 입력하세요"
+              placeholderTextColor="#9aa3b2"
+              style={[styles.input, styles.editorTextarea]}
+              multiline
+            />
+          </View>
+
+          <View style={styles.editorActions}>
+            {draft?.id ? (
+              <Pressable onPress={confirmDelete} style={styles.editorDangerBtn}>
+                <Text style={styles.editorDangerText}>삭제</Text>
+              </Pressable>
+            ) : (
+              <View />
+            )}
+            <Pressable onPress={handleSave} style={styles.editorSaveBtn}>
+              <Text style={styles.editorSaveText}>저장</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+      <PickerSheet
+        visible={iosDateSheetVisible}
+        title="날짜 선택"
+        value={iosTempDate}
+        mode="date"
+        onCancel={() => setIosDateSheetVisible(false)}
+        onConfirm={(selected) => {
+          setIosDateSheetVisible(false)
+          if (!selected) return
+          setDate(dateToKey(selected.getFullYear(), selected.getMonth() + 1, selected.getDate()))
+        }}
+      />
+      <PickerSheet
+        visible={iosTimeSheetVisible}
+        title="시간 선택"
+        value={iosTempTime}
+        mode="time"
+        is24Hour={false}
+        onCancel={() => setIosTimeSheetVisible(false)}
+        onConfirm={(selected) => {
+          setIosTimeSheetVisible(false)
+          if (!selected) return
+          setTime(`${pad2(selected.getHours())}:${pad2(selected.getMinutes())}`)
+        }}
+      />
+      {Platform.OS === "android" && showDatePicker ? (
+        <DateTimePicker
+          value={dateValue}
+          mode="date"
+          display="calendar"
+          onChange={(_event, selected) => {
+            setShowDatePicker(false)
+            if (!selected) return
+            setDate(dateToKey(selected.getFullYear(), selected.getMonth() + 1, selected.getDate()))
+          }}
+        />
+      ) : null}
+      {Platform.OS === "android" && showTimePicker ? (
+        <DateTimePicker
+          value={timeValue}
+          mode="time"
+          display="clock"
+          is24Hour={false}
+          onChange={(_event, selected) => {
+            setShowTimePicker(false)
+            if (!selected) return
+            setTime(`${pad2(selected.getHours())}:${pad2(selected.getMinutes())}`)
+          }}
+        />
+      ) : null}
+    </Modal>
+  )
+}
+
+function PickerSheet({ visible, title, value, mode, is24Hour = true, onCancel, onConfirm }) {
+  const [temp, setTemp] = useState(value instanceof Date ? value : new Date())
+
+  useEffect(() => {
+    if (!visible) return
+    setTemp(value instanceof Date ? value : new Date())
+  }, [visible, value])
+
+  if (!visible) return null
+
+  return (
+    <Modal transparent animationType="fade" presentationStyle="overFullScreen" statusBarTranslucent>
+      <View style={styles.sheetOverlay}>
+        <Pressable style={styles.sheetBackdrop} onPress={onCancel} />
+        <View style={styles.sheetCard}>
+          <View style={styles.sheetHeader}>
+            <Text style={styles.sheetTitle}>{title}</Text>
+            <View style={styles.sheetHeaderRight}>
+              <Pressable onPress={onCancel} style={styles.sheetBtnGhost}>
+                <Text style={styles.sheetBtnGhostText}>취소</Text>
+              </Pressable>
+              <Pressable onPress={() => onConfirm?.(temp)} style={styles.sheetBtnPrimary}>
+                <Text style={styles.sheetBtnPrimaryText}>확인</Text>
+              </Pressable>
+            </View>
+          </View>
+          <DateTimePicker
+            value={temp}
+            mode={mode}
+            is24Hour={is24Hour}
+            display={mode === "date" ? "inline" : "spinner"}
+            onChange={(_event, selected) => {
+              if (!selected) return
+              setTemp(selected)
+            }}
+            style={styles.sheetPicker}
+          />
+        </View>
+      </View>
+    </Modal>
   )
 }
 
@@ -417,8 +1204,15 @@ function CalendarScreen({
   windows,
   activeTabId,
   onSelectTab,
+  onAddWindow,
+  onRenameWindow,
+  onDeleteWindow,
+  onChangeWindowColor,
   holidaysByDate,
-  ensureHolidayYear
+  ensureHolidayYear,
+  onAddPlan,
+  onEditPlan,
+  onSelectDateKey
 }) {
   const today = new Date()
   const [viewYear, setViewYear] = useState(today.getFullYear())
@@ -487,6 +1281,7 @@ function CalendarScreen({
   function openDate(day) {
     if (!day) return
     const key = dateToKey(viewYear, viewMonth, day)
+    onSelectDateKey?.(key)
     setSelectedDateKey(key)
   }
 
@@ -506,7 +1301,16 @@ function CalendarScreen({
         titleStyle={styles.calendarTitleOffset}
         buttonsStyle={styles.calendarButtonsOffset}
       />
-      <WindowTabs windows={windows} activeId={activeTabId} onSelect={onSelectTab} tone="light" />
+      <WindowTabs
+        windows={windows}
+        activeId={activeTabId}
+        onSelect={onSelectTab}
+        onAddWindow={onAddWindow}
+        onRenameWindow={onRenameWindow}
+        onDeleteWindow={onDeleteWindow}
+        onChangeWindowColor={onChangeWindowColor}
+        tone="light"
+      />
       <View style={[styles.card, styles.calendarCard]}>
           <View style={styles.calendarHeaderWrap}>
             <View style={styles.calendarHeader}>
@@ -635,9 +1439,20 @@ function CalendarScreen({
                   <Text style={styles.dayModalCountText}>{dayItems.length}개</Text>
                 </View>
               </View>
-              <Pressable onPress={() => setSelectedDateKey(null)} style={styles.dayModalCloseBtn}>
-                <Text style={styles.dayModalCloseX}>닫기</Text>
-              </Pressable>
+              <View style={styles.dayModalHeaderRight}>
+                <Pressable
+                  onPress={() => {
+                    if (!selectedDateKey) return
+                    onAddPlan?.(selectedDateKey)
+                  }}
+                  style={styles.dayModalAddBtn}
+                >
+                  <Text style={styles.dayModalAddText}>+ 추가</Text>
+                </Pressable>
+                <Pressable onPress={() => setSelectedDateKey(null)} style={styles.dayModalCloseBtn}>
+                  <Text style={styles.dayModalCloseX}>닫기</Text>
+                </Pressable>
+              </View>
             </View>
             <ScrollView contentContainerStyle={styles.dayModalList}>
               {dayItems.length === 0 ? (
@@ -650,14 +1465,18 @@ function CalendarScreen({
                   const line = formatLine(item)
                   const time = item?.time ? String(item.time).trim() : ""
                   return (
-                    <View key={item.id ?? `${item.date}-${item.content}`} style={styles.dayModalItemRow}>
+                    <Pressable
+                      key={item.id ?? `${item.date}-${item.content}`}
+                      style={styles.dayModalItemRow}
+                      onPress={() => onEditPlan?.(item)}
+                    >
                       {time ? (
                         <Text style={styles.dayModalItemTime}>{time}</Text>
                       ) : (
                         <Text style={styles.dayModalItemTimeEmpty}>{"\u00A0"}</Text>
                       )}
                       <Text style={styles.dayModalItemText}>{line.text}</Text>
-                    </View>
+                    </Pressable>
                   )
                 })
               )}
@@ -681,8 +1500,10 @@ function AppInner() {
     ],
     [insets.bottom]
   )
+  const fabBottom = useMemo(() => 50 + insets.bottom + 18, [insets.bottom])
 
   const [session, setSession] = useState(null)
+  const [clientId, setClientId] = useState("")
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [authLoading, setAuthLoading] = useState(false)
@@ -700,6 +1521,10 @@ function AppInner() {
   const [holidaysByDate, setHolidaysByDate] = useState(() => new Map())
   const holidayYearCacheRef = useRef(new Map())
   const holidayInflightRef = useRef(new Map())
+  const [planEditorVisible, setPlanEditorVisible] = useState(false)
+  const [planDraft, setPlanDraft] = useState(null)
+  const [activeScreen, setActiveScreen] = useState("List")
+  const lastCalendarDateKeyRef = useRef(null)
 
   const memoYear = new Date().getFullYear()
 
@@ -765,8 +1590,82 @@ function AppInner() {
   }, [])
 
   useEffect(() => {
+    const userId = session?.user?.id
+    if (!supabase || !userId) return
+
+    let disposed = false
+    const timers = new Map()
+
+    const schedule = (key, fn, delay = 350) => {
+      if (disposed) return
+      if (timers.has(key)) clearTimeout(timers.get(key))
+      const t = setTimeout(() => {
+        timers.delete(key)
+        fn()
+      }, delay)
+      timers.set(key, t)
+    }
+
+    const channel = supabase
+      .channel(`planner-mobile-sync-${userId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "plans", filter: `user_id=eq.${userId}` },
+        () => schedule("plans", () => loadPlans(userId))
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "windows", filter: `user_id=eq.${userId}` },
+        () =>
+          schedule("windows", async () => {
+            await loadWindows(userId)
+            await loadRightMemos(userId, memoYear)
+          })
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "right_memos", filter: `user_id=eq.${userId}` },
+        () => schedule("right_memos", () => loadRightMemos(userId, memoYear))
+      )
+      .subscribe()
+
+    return () => {
+      disposed = true
+      for (const t of timers.values()) clearTimeout(t)
+      timers.clear()
+      try {
+        supabase.removeChannel(channel)
+      } catch (_e) {
+        // ignore
+      }
+    }
+  }, [session?.user?.id])
+
+  useEffect(() => {
     ensureHolidayYear?.(new Date().getFullYear())
   }, [ensureHolidayYear])
+
+  useEffect(() => {
+    let mounted = true
+    ;(async () => {
+      try {
+        const raw = await AsyncStorage.getItem(CLIENT_ID_KEY)
+        if (!mounted) return
+        if (raw) {
+          setClientId(raw)
+          return
+        }
+        const next = genClientId()
+        await AsyncStorage.setItem(CLIENT_ID_KEY, next)
+        if (mounted) setClientId(next)
+      } catch (_e) {
+        if (mounted) setClientId(genClientId())
+      }
+    })()
+    return () => {
+      mounted = false
+    }
+  }, [])
 
   useEffect(() => {
     let mounted = true
@@ -868,6 +1767,130 @@ function AppInner() {
     if (!next.find((w) => w.id === activeTabId)) setActiveTabId("all")
   }
 
+  async function refreshAfterWindowChange(userId) {
+    await loadPlans(userId)
+    await loadWindows(userId)
+    await loadRightMemos(userId, memoYear)
+  }
+
+  function pickNextWindowColor(currentWindows) {
+    const used = new Set(
+      (currentWindows ?? [])
+        .filter((w) => w && w.id !== "all")
+        .map((w) => String(w?.color ?? "").toLowerCase())
+        .filter(Boolean)
+    )
+    const available = WINDOW_COLORS.find((c) => !used.has(String(c).toLowerCase()))
+    return available ?? WINDOW_COLORS[(currentWindows?.length ?? 1) % WINDOW_COLORS.length] ?? WINDOW_COLORS[0]
+  }
+
+  async function addWindow(title, color) {
+    const userId = session?.user?.id
+    if (!supabase || !userId) return
+    const nextTitle = normalizeWindowTitle(title)
+    if (!nextTitle || nextTitle === "통합") {
+      Alert.alert("오류", "탭 이름을 입력해주세요.")
+      return
+    }
+    const exists = (windows ?? []).some((w) => w?.id !== "all" && normalizeWindowTitle(w.title) === nextTitle)
+    if (exists) {
+      Alert.alert("오류", "같은 이름의 탭이 이미 있어요.")
+      return
+    }
+    const sortOrder = Math.max(10, (windows ?? []).filter((w) => w?.id !== "all").length * 10 + 10)
+    const normalizedColor = WINDOW_COLORS.includes(String(color ?? "").toLowerCase())
+      ? String(color).toLowerCase()
+      : pickNextWindowColor(windows)
+    const { error } = await supabase.from("windows").insert({
+      user_id: userId,
+      title: nextTitle,
+      color: normalizedColor,
+      sort_order: sortOrder,
+      is_fixed: false
+    })
+    if (error) {
+      Alert.alert("오류", error.message || "탭 추가 실패")
+      return
+    }
+    await refreshAfterWindowChange(userId)
+  }
+
+  async function renameWindow(windowItem, nextTitleRaw) {
+    const userId = session?.user?.id
+    if (!supabase || !userId) return
+    if (!windowItem || windowItem.id === "all") return
+    const nextTitle = normalizeWindowTitle(nextTitleRaw)
+    const prevTitle = normalizeWindowTitle(windowItem.title)
+    if (!nextTitle) return
+    if (nextTitle === "통합") {
+      Alert.alert("오류", "이 이름은 사용할 수 없어요.")
+      return
+    }
+    if (nextTitle === prevTitle) return
+    const exists = (windows ?? []).some(
+      (w) => w?.id !== "all" && String(w?.id) !== String(windowItem.id) && normalizeWindowTitle(w.title) === nextTitle
+    )
+    if (exists) {
+      Alert.alert("오류", "같은 이름의 탭이 이미 있어요.")
+      return
+    }
+    const { error } = await supabase
+      .from("windows")
+      .update({ title: nextTitle })
+      .eq("user_id", userId)
+      .eq("id", windowItem.id)
+    if (error) {
+      Alert.alert("오류", error.message || "탭 수정 실패")
+      return
+    }
+    await supabase
+      .from("plans")
+      .update({ category_id: nextTitle })
+      .eq("user_id", userId)
+      .eq("category_id", prevTitle)
+    await refreshAfterWindowChange(userId)
+  }
+
+  async function changeWindowColor(windowItem, nextColor) {
+    const userId = session?.user?.id
+    if (!supabase || !userId) return
+    if (!windowItem || windowItem.id === "all") return
+    const normalizedColor = WINDOW_COLORS.includes(String(nextColor ?? "").toLowerCase())
+      ? String(nextColor).toLowerCase()
+      : pickNextWindowColor(windows)
+    const { error } = await supabase
+      .from("windows")
+      .update({ color: normalizedColor })
+      .eq("user_id", userId)
+      .eq("id", windowItem.id)
+    if (error) {
+      Alert.alert("오류", error.message || "색 변경 실패")
+      return
+    }
+    await loadWindows(userId)
+  }
+
+  async function deleteWindow(windowItem) {
+    const userId = session?.user?.id
+    if (!supabase || !userId) return
+    if (!windowItem || windowItem.id === "all") return
+    const title = normalizeWindowTitle(windowItem.title)
+    const deletedAt = new Date().toISOString()
+    await supabase
+      .from("plans")
+      .update({ deleted_at: deletedAt, client_id: clientId || null, updated_at: deletedAt })
+      .eq("user_id", userId)
+      .eq("category_id", title)
+    await supabase.from("right_memos").delete().eq("user_id", userId).eq("window_id", windowItem.id)
+    const { error } = await supabase.from("windows").delete().eq("user_id", userId).eq("id", windowItem.id)
+    if (error) {
+      Alert.alert("오류", error.message || "탭 삭제 실패")
+      return
+    }
+    if (String(activeTabId) === String(windowItem.id)) setActiveTabId("all")
+    await refreshAfterWindowChange(userId)
+  }
+
   async function loadRightMemos(userId, year) {
     if (!supabase || !userId) return
     const { data, error } = await supabase
@@ -882,6 +1905,81 @@ function AppInner() {
       map[row.window_id] = String(row?.content ?? "")
     }
     setRightMemos(map)
+  }
+
+  async function saveRightMemo(windowId, content) {
+    const userId = session?.user?.id
+    if (!supabase || !userId) return
+    const id = String(windowId ?? "").trim()
+    if (!id || id === "all") return
+    const text = String(content ?? "")
+    const trimmed = text.trim()
+    if (!trimmed) {
+      const { error } = await supabase
+        .from("right_memos")
+        .delete()
+        .eq("user_id", userId)
+        .eq("year", memoYear)
+        .eq("window_id", id)
+      if (error) {
+        Alert.alert("오류", error.message || "메모 삭제 실패")
+        return
+      }
+      setRightMemos((prev) => ({ ...(prev ?? {}), [id]: "" }))
+      return
+    }
+    const payload = {
+      user_id: userId,
+      year: memoYear,
+      window_id: id,
+      content: text
+    }
+    const { error } = await supabase.from("right_memos").upsert(payload, {
+      onConflict: "user_id,year,window_id"
+    })
+    if (error) {
+      Alert.alert("오류", error.message || "메모 저장 실패")
+      return
+    }
+    setRightMemos((prev) => ({ ...(prev ?? {}), [id]: text }))
+  }
+
+  async function upsertPlan(userId, next) {
+    if (!supabase || !userId) return
+    const payload = {
+      user_id: userId,
+      date: String(next?.date ?? "").trim(),
+      time: String(next?.time ?? "").trim() || null,
+      content: String(next?.content ?? "").trim(),
+      category_id: String(next?.category_id ?? "__general__").trim() || "__general__",
+      client_id: clientId || null,
+      updated_at: new Date().toISOString()
+    }
+    if (!payload.date || !payload.content) return
+
+    setLoading(true)
+    if (next?.id) {
+      const { error } = await supabase.from("plans").update(payload).eq("id", next.id).eq("user_id", userId)
+      if (error) setAuthMessage(error.message || "Save failed.")
+    } else {
+      const { error } = await supabase.from("plans").insert(payload)
+      if (error) setAuthMessage(error.message || "Save failed.")
+    }
+    await loadPlans(userId)
+    setLoading(false)
+  }
+
+  async function softDeletePlan(userId, planId) {
+    if (!supabase || !userId || !planId) return
+    setLoading(true)
+    const { error } = await supabase
+      .from("plans")
+      .update({ deleted_at: new Date().toISOString(), client_id: clientId || null, updated_at: new Date().toISOString() })
+      .eq("id", planId)
+      .eq("user_id", userId)
+    if (error) setAuthMessage(error.message || "Delete failed.")
+    await loadPlans(userId)
+    setLoading(false)
   }
 
   async function handleSignIn() {
@@ -924,6 +2022,29 @@ function AppInner() {
     if (activeTabId === "all") return null
     return windows.find((w) => w.id === activeTabId)?.title ?? null
   }, [windows, activeTabId])
+
+  function openNewPlan(dateKey) {
+    const defaultCategory = activeTitle ? String(activeTitle) : "__general__"
+    setPlanDraft({
+      date: String(dateKey ?? ""),
+      time: "",
+      content: "",
+      category_id: defaultCategory
+    })
+    setPlanEditorVisible(true)
+  }
+
+  function openEditPlan(item) {
+    if (!item) return
+    setPlanDraft({
+      id: item.id,
+      date: String(item.date ?? ""),
+      time: String(item.time ?? ""),
+      content: String(item.content ?? ""),
+      category_id: String(item.category_id ?? "__general__")
+    })
+    setPlanEditorVisible(true)
+  }
 
   const filteredPlans = useMemo(() => {
     if (!activeTitle) return plans
@@ -1099,13 +2220,46 @@ function AppInner() {
 
   return (
     <NavigationContainer>
+      <PlanEditorModal
+        visible={planEditorVisible}
+        draft={planDraft}
+        windows={windows}
+        onClose={() => setPlanEditorVisible(false)}
+        onSave={async (next) => {
+          await upsertPlan(session?.user?.id, next)
+          setPlanEditorVisible(false)
+        }}
+        onDelete={async (id) => {
+          await softDeletePlan(session?.user?.id, id)
+          setPlanEditorVisible(false)
+        }}
+      />
+      {activeScreen !== "Memo" ? (
+        <Pressable
+          onPress={() => {
+            const today = new Date()
+            const todayKey = dateToKey(today.getFullYear(), today.getMonth() + 1, today.getDate())
+            const key = activeScreen === "Calendar" ? lastCalendarDateKeyRef.current || todayKey : todayKey
+            openNewPlan(key)
+          }}
+          style={[styles.fab, { bottom: fabBottom }]}
+        >
+          <Text style={styles.fabText}>+</Text>
+        </Pressable>
+      ) : null}
       <Tab.Navigator
+        screenListeners={{
+          state: (e) => {
+            const route = e?.data?.state?.routes?.[e.data.state.index]
+            if (route?.name) setActiveScreen(route.name)
+          }
+        }}
         screenOptions={({ route }) => ({
           headerShown: false,
           tabBarStyle,
           tabBarLabelStyle: styles.tabLabel,
           tabBarItemStyle: styles.tabItem,
-          tabBarActiveTintColor: "#1d4ed8",
+          tabBarActiveTintColor: ACCENT_BLUE,
           tabBarInactiveTintColor: "#94a3b8",
           tabBarHideOnKeyboard: true,
           tabBarIcon: ({ focused }) => {
@@ -1122,8 +2276,14 @@ function AppInner() {
               windows={windows}
               activeTabId={activeTabId}
               onSelectTab={setActiveTabId}
+              onAddWindow={addWindow}
+              onRenameWindow={renameWindow}
+              onDeleteWindow={deleteWindow}
+              onChangeWindowColor={changeWindowColor}
               holidaysByDate={holidaysByDate}
               ensureHolidayYear={ensureHolidayYear}
+              onAddPlan={openNewPlan}
+              onEditPlan={openEditPlan}
               onRefresh={() => {
                 loadPlans(session?.user?.id)
                 loadWindows(session?.user?.id)
@@ -1139,8 +2299,14 @@ function AppInner() {
               memoText={memoText}
               loading={loading}
               windows={windows}
+              rightMemos={rightMemos}
               activeTabId={activeTabId}
               onSelectTab={setActiveTabId}
+              onAddWindow={addWindow}
+              onRenameWindow={renameWindow}
+              onDeleteWindow={deleteWindow}
+              onChangeWindowColor={changeWindowColor}
+              onSaveMemo={saveRightMemo}
               onRefresh={() => {
                 loadPlans(session?.user?.id)
                 loadWindows(session?.user?.id)
@@ -1158,8 +2324,17 @@ function AppInner() {
               windows={windows}
               activeTabId={activeTabId}
               onSelectTab={setActiveTabId}
+              onAddWindow={addWindow}
+              onRenameWindow={renameWindow}
+              onDeleteWindow={deleteWindow}
+              onChangeWindowColor={changeWindowColor}
               holidaysByDate={holidaysByDate}
               ensureHolidayYear={ensureHolidayYear}
+              onAddPlan={openNewPlan}
+              onEditPlan={openEditPlan}
+              onSelectDateKey={(key) => {
+                lastCalendarDateKeyRef.current = key
+              }}
               onRefresh={() => {
                 loadPlans(session?.user?.id)
                 loadWindows(session?.user?.id)
@@ -1215,7 +2390,7 @@ const styles = StyleSheet.create({
     color: "#94a3b8"
   },
   tabIconActive: {
-    color: "#1d4ed8"
+    color: ACCENT_BLUE
   },
   authScreen: {
     paddingTop: 0,
@@ -1238,7 +2413,7 @@ const styles = StyleSheet.create({
     width: 56,
     height: 56,
     borderRadius: 18,
-    backgroundColor: "#1d4ed8",
+    backgroundColor: ACCENT_BLUE,
     alignItems: "center",
     justifyContent: "center",
     shadowColor: "#0f172a",
@@ -1334,8 +2509,8 @@ const styles = StyleSheet.create({
     justifyContent: "center"
   },
   checkboxChecked: {
-    backgroundColor: "#1d4ed8",
-    borderColor: "#1d4ed8"
+    backgroundColor: ACCENT_BLUE,
+    borderColor: ACCENT_BLUE
   },
   checkboxTick: {
     color: "#ffffff",
@@ -1369,17 +2544,17 @@ const styles = StyleSheet.create({
   authAltBtnText: {
     fontSize: 12,
     fontWeight: "800",
-    color: "#1d4ed8"
+    color: ACCENT_BLUE
   },
   authMessage: {
     marginTop: 12,
     fontSize: 12,
-    color: "#dc2626",
+    color: ACCENT_RED,
     fontWeight: "700",
     textAlign: "center"
   },
   authMessageInfo: {
-    color: "#1d4ed8"
+    color: ACCENT_BLUE
   },
   authFooterNote: {
     marginTop: 14,
@@ -1391,17 +2566,18 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginBottom: 12,
-    marginTop: 8
+    marginBottom: 10,
+    marginTop: 6
   },
   headerButtons: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8
+    gap: 8,
+    marginRight: 6
   },
   title: {
-    fontSize: 22,
-    fontWeight: "700",
+    fontSize: 24,
+    fontWeight: "900",
     color: "#0f172a"
   },
   subtitle: {
@@ -1418,10 +2594,14 @@ const styles = StyleSheet.create({
   tabBarWrap: {
     marginTop: 4,
     marginBottom: 4,
-    padding: 3,
-    borderRadius: 10,
+    padding: 4,
+    borderRadius: 12,
     backgroundColor: "#eef2f7",
     borderWidth: 0
+  },
+  tabBarInner: {
+    position: "relative",
+    height: 44
   },
   tabBarWrapDark: {
     backgroundColor: "#1f2937",
@@ -1441,53 +2621,165 @@ const styles = StyleSheet.create({
   tabScrollDark: {
     maxHeight: 44
   },
+  tabAddBtn: {
+    position: "absolute",
+    right: 4,
+    top: 5,
+    height: 34,
+    width: 34,
+    borderRadius: 10,
+    backgroundColor: "#eef2f7",
+    borderWidth: 1,
+    borderColor: "rgba(148, 163, 184, 0.22)",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  tabAddText: {
+    fontSize: 18,
+    fontWeight: "900",
+    color: ACCENT_BLUE,
+    marginTop: -1
+  },
+  tabMenuBtn: {
+    marginLeft: 6,
+    height: 22,
+    width: 20,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  tabMenuIcon: {
+    fontSize: 16,
+    fontWeight: "900",
+    color: "#94a3b8",
+    includeFontPadding: false
+  },
+  menuList: {
+    gap: 10
+  },
+  menuItem: {
+    height: 44,
+    borderRadius: 14,
+    backgroundColor: "#f1f5f9",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    paddingHorizontal: 14,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  menuItemDanger: {
+    backgroundColor: "#fff1f2",
+    borderColor: "#fecdd3"
+  },
+  menuItemText: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  menuItemTextDanger: {
+    color: "#e11d48"
+  },
+  menuInput: {
+    height: 44,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    backgroundColor: "#ffffff",
+    paddingHorizontal: 14,
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#0f172a"
+  },
+  menuHint: {
+    marginTop: 10,
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#64748b"
+  },
+  colorGrid: {
+    marginTop: 12,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10
+  },
+  colorSwatch: {
+    width: 34,
+    height: 34,
+    borderRadius: 10
+  },
+  colorSwatchActive: {
+    borderWidth: 3,
+    borderColor: "#0f172a"
+  },
   listMonthBar: {
     marginTop: 0,
     marginBottom: 4,
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
+    justifyContent: "space-between",
     paddingHorizontal: 4,
-    position: "relative",
     height: 34
   },
-  listMonthLeft: {
-    position: "absolute",
-    left: 0,
-    top: 0,
-    bottom: 0,
+  listMonthLeftGroup: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "transparent",
+    borderWidth: 0,
+    borderRadius: 12,
+    padding: 0
+  },
+  listMonthNavButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 12,
+    backgroundColor: "transparent",
+    alignItems: "center",
     justifyContent: "center"
   },
-  listMonthRight: {
-    position: "absolute",
-    right: 0,
-    top: 0,
-    bottom: 0,
+  listMonthNavText: {
+    fontSize: 20,
+    fontWeight: "900",
+    color: ACCENT_BLUE
+  },
+  listMonthRightGroup: {
     flexDirection: "row",
     alignItems: "center",
     gap: 6
   },
-  listMonthTextCentered: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    textAlign: "center",
-    fontSize: 14,
-    fontWeight: "700",
+  listMonthText: {
+    fontSize: 16,
+    fontWeight: "900",
     color: "#0f172a"
   },
   listTodayButton: {
-    height: 28,
-    paddingHorizontal: 10,
-    borderRadius: 10,
+    height: 32,
+    paddingHorizontal: 12,
+    borderRadius: 12,
     backgroundColor: "#eef2ff",
+    borderWidth: 1,
+    borderColor: "#dbeafe",
     alignItems: "center",
     justifyContent: "center"
+  },
+  listAddButton: {
+    height: 32,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: "#dbeafe",
+    borderWidth: 1,
+    borderColor: "#bfdbfe",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  listAddText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: ACCENT_BLUE
   },
   listTodayText: {
     fontSize: 12,
     fontWeight: "700",
-    color: "#1d4ed8"
+    color: ACCENT_BLUE
   },
   tabPill: {
     flexDirection: "row",
@@ -1496,7 +2788,9 @@ const styles = StyleSheet.create({
     height: 34,
     paddingHorizontal: 10,
     borderRadius: 8,
-    backgroundColor: "transparent"
+    backgroundColor: "transparent",
+    borderWidth: 1,
+    borderColor: "rgba(148, 163, 184, 0.22)"
   },
   tabPillActive: {
     backgroundColor: "#ffffff",
@@ -1575,14 +2869,21 @@ const styles = StyleSheet.create({
     fontWeight: "700"
   },
   ghostButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 10,
-    backgroundColor: "#eef2ff"
+    width: 44,
+    height: 44,
+    borderRadius: 16,
+    backgroundColor: "#eef2ff",
+    alignItems: "center",
+    justifyContent: "center"
   },
   ghostButtonText: {
-    color: "#1d4ed8",
-    fontWeight: "600"
+    color: ACCENT_BLUE,
+    fontWeight: "900",
+    fontSize: 22,
+    includeFontPadding: false
+  },
+  ghostButtonTextDisabled: {
+    opacity: 0.55
   },
   ghostButtonDark: {
     backgroundColor: "#22252b"
@@ -1591,7 +2892,7 @@ const styles = StyleSheet.create({
     color: "#e5e7eb"
   },
   errorText: {
-    color: "#dc2626",
+    color: ACCENT_RED,
     fontSize: 12,
     marginTop: 8
   },
@@ -1602,16 +2903,21 @@ const styles = StyleSheet.create({
   },
   sectionHeader: {
     paddingVertical: 10,
-    paddingHorizontal: 10,
-    marginTop: 10
+    paddingHorizontal: 12,
+    backgroundColor: "#f8fafc",
+    borderTopWidth: 1,
+    borderTopColor: "#eef2f7",
+    borderBottomWidth: 1,
+    borderBottomColor: "#eef2f7"
   },
   sectionHeaderToday: {
     backgroundColor: "#eef2ff"
   },
   sectionHeaderDateText: {
-    fontSize: 13,
+    fontSize: 14,
     fontWeight: "900",
-    color: "#0f172a"
+    color: "#0f172a",
+    marginLeft: 6
   },
   sectionHeaderRow: {
     flexDirection: "row",
@@ -1630,10 +2936,10 @@ const styles = StyleSheet.create({
     gap: 8
   },
   sectionHeaderDowBadge: {
-    minWidth: 26,
-    height: 22,
+    minWidth: 24,
+    height: 20,
     paddingHorizontal: 8,
-    borderRadius: 8,
+    borderRadius: 10,
     backgroundColor: "rgba(100, 116, 139, 0.10)",
     alignItems: "center",
     justifyContent: "center"
@@ -1648,67 +2954,177 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(220, 38, 38, 0.10)"
   },
   sectionHeaderDowBadgeText: {
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: "900",
     color: "#475569"
   },
   sectionHeaderDowBadgeTextSun: {
-    color: "#dc2626"
+    color: ACCENT_RED
   },
   sectionHeaderDowBadgeTextSat: {
     color: "#2563eb"
   },
   sectionHeaderDowBadgeTextHoliday: {
-    color: "#dc2626"
+    color: ACCENT_RED
   },
   sectionHeaderHolidayBadge: {
     maxWidth: 180,
-    height: 22,
+    height: 20,
     paddingHorizontal: 10,
-    borderRadius: 8,
+    borderRadius: 10,
     backgroundColor: "rgba(220, 38, 38, 0.10)",
     alignItems: "center",
     justifyContent: "center"
   },
   sectionHeaderHolidayBadgeText: {
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: "900",
-    color: "#dc2626"
+    color: ACCENT_RED
   },
   listContent: {
     paddingBottom: 12,
-    paddingHorizontal: 10,
-    paddingTop: 2
+    paddingHorizontal: 0,
+    paddingTop: 0
   },
   itemRow: {
     flexDirection: "row",
-    alignItems: "center",
-    paddingVertical: 10,
+    alignItems: "flex-start",
+    paddingVertical: 9,
     paddingHorizontal: 12,
+    gap: 10,
     borderBottomWidth: 1,
     borderBottomColor: "#eef2f7"
   },
-  itemTime: {
-    width: 58,
-    fontSize: 12,
-    fontWeight: "800",
-    color: "#334155"
+  itemLeftCol: {
+    width: 64,
+    paddingTop: 1,
+    alignItems: "flex-end",
+    paddingRight: 10
   },
-  itemTimeEmpty: {
-    width: 58,
+  itemTimeText: {
     fontSize: 12,
-    fontWeight: "800",
-    color: "#94a3b8"
+    fontWeight: "900",
+    color: "#334155",
+    textAlign: "right"
   },
-  itemText: {
+  itemTimeTextEmpty: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#94a3b8",
+    textAlign: "right"
+  },
+  itemMainCol: {
+    flex: 1
+  },
+  itemTopRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10
+  },
+  itemTitle: {
     flex: 1,
-    fontSize: 13,
+    fontSize: 14,
+    fontWeight: "800",
     color: "#0f172a"
+  },
+  itemCategoryBadge: {
+    flexShrink: 0,
+    maxWidth: "100%",
+    height: 20,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    backgroundColor: "#f8fafc",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6
+  },
+  itemCategoryDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 999
+  },
+  itemCategoryText: {
+    flexShrink: 1,
+    fontSize: 11,
+    fontWeight: "900",
+    color: "#475569"
   },
   memoContent: {
     paddingTop: 8,
     paddingBottom: 12,
     paddingHorizontal: 16
+  },
+  memoAllList: {
+    paddingTop: 10,
+    paddingBottom: 14,
+    paddingHorizontal: 14,
+    gap: 12
+  },
+  memoAllCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    padding: 14
+  },
+  memoAllHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 8
+  },
+  memoAllDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 999
+  },
+  memoAllTitle: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  memoAllBody: {
+    fontSize: 13,
+    lineHeight: 19,
+    fontWeight: "600",
+    color: "#0f172a"
+  },
+  memoAllEmpty: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#94a3b8"
+  },
+  memoEditorWrap: {
+    flex: 1,
+    paddingTop: 10,
+    paddingBottom: 12,
+    paddingHorizontal: 16
+  },
+  memoEditorBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 10
+  },
+  memoEditorTitle: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  memoInput: {
+    flex: 1,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    backgroundColor: "#ffffff",
+    padding: 14,
+    fontSize: 14,
+    lineHeight: 20,
+    fontWeight: "600",
+    color: "#0f172a"
   },
   memoPaper: {
     backgroundColor: "#ffffff",
@@ -1801,17 +3217,19 @@ const styles = StyleSheet.create({
     paddingTop: 2
   },
   calendarNavButton: {
-    width: 34,
-    height: 34,
-    borderRadius: 10,
-    backgroundColor: "#f1f5ff",
+    width: 32,
+    height: 32,
+    borderRadius: 12,
+    backgroundColor: "#eef2ff",
+    borderWidth: 1,
+    borderColor: "#dbeafe",
     alignItems: "center",
     justifyContent: "center"
   },
   calendarNavText: {
     fontSize: 18,
     fontWeight: "700",
-    color: "#1d4ed8"
+    color: ACCENT_BLUE
   },
   calendarTitle: {
     fontSize: 16,
@@ -1875,7 +3293,7 @@ const styles = StyleSheet.create({
     color: "#0f172a"
   },
   calendarDayToday: {
-    color: "#1d4ed8"
+    color: ACCENT_BLUE
   },
   calendarDaySelected: {
     color: "#1e40af"
@@ -1884,20 +3302,20 @@ const styles = StyleSheet.create({
     color: "#cbd5f5"
   },
   calendarDaySunday: {
-    color: "#dc2626"
+    color: ACCENT_RED
   },
   calendarDaySaturday: {
-    color: "#2563eb"
+    color: ACCENT_BLUE
   },
   calendarDayHoliday: {
-    color: "#dc2626"
+    color: ACCENT_RED
   },
   calendarHolidayText: {
     width: "100%",
     marginTop: 2,
     fontSize: 8,
     fontWeight: "800",
-    color: "#dc2626",
+    color: ACCENT_RED,
     lineHeight: 10,
     textAlign: "left"
   },
@@ -1934,7 +3352,7 @@ const styles = StyleSheet.create({
   calendarMoreText: {
     fontSize: 8,
     fontWeight: "700",
-    color: "#1d4ed8"
+    color: ACCENT_BLUE
   },
   dayModalOverlay: {
     flex: 1,
@@ -1977,6 +3395,24 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 8
   },
+  dayModalHeaderRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  dayModalAddBtn: {
+    height: 32,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: ACCENT_BLUE,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  dayModalAddText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#ffffff"
+  },
   dayModalTitle: {
     fontSize: 16,
     fontWeight: "800",
@@ -1995,7 +3431,7 @@ const styles = StyleSheet.create({
   dayModalCountText: {
     fontSize: 12,
     fontWeight: "800",
-    color: "#1d4ed8"
+    color: ACCENT_BLUE
   },
   dayModalCloseBtn: {
     height: 32,
@@ -2053,6 +3489,260 @@ const styles = StyleSheet.create({
     flex: 1,
     fontSize: 13,
     color: "#0f172a"
+  },
+  editorCard: {
+    width: "92%",
+    maxWidth: 520,
+    maxHeight: "82%",
+    backgroundColor: "#ffffff",
+    borderRadius: 16,
+    padding: 16,
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.16,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 8
+  },
+  editorHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 10
+  },
+  editorTitle: {
+    fontSize: 16,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  editorCloseBtn: {
+    height: 32,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: "#f1f5f9",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  editorCloseText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#334155"
+  },
+  editorMetaRow: {
+    marginTop: 10
+  },
+  editorMetaLabel: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#475569",
+    marginBottom: 6
+  },
+  editorMetaValue: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  editorCategoryRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingRight: 8
+  },
+  editorCategoryPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    height: 34,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: "#f1f5f9",
+    borderWidth: 1,
+    borderColor: "#e2e8f0"
+  },
+  editorCategoryPillActive: {
+    backgroundColor: "#eef2ff",
+    borderColor: "#c7d2fe"
+  },
+  editorCategoryText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#334155"
+  },
+  editorCategoryTextActive: {
+    color: ACCENT_BLUE
+  },
+  editorInput: {
+    marginBottom: 0
+  },
+  editorTextarea: {
+    marginBottom: 0,
+    height: 110,
+    textAlignVertical: "top"
+  },
+  editorActions: {
+    marginTop: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
+  },
+  editorPickerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    height: 44,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#d6dbe6",
+    paddingHorizontal: 12,
+    backgroundColor: "#ffffff"
+  },
+  editorPickerLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  editorPickerRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10
+  },
+  editorPickerIcon: {
+    fontSize: 14
+  },
+  editorPickerValue: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#0f172a"
+  },
+  editorPickerHint: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: ACCENT_BLUE
+  },
+  editorPickerClearPill: {
+    height: 24,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    backgroundColor: "#f1f5f9",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  editorPickerClearText: {
+    fontSize: 11,
+    fontWeight: "900",
+    color: "#475569"
+  },
+  sheetOverlay: {
+    flex: 1,
+    justifyContent: "flex-end"
+  },
+  sheetBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(15, 23, 42, 0.45)"
+  },
+  sheetCard: {
+    backgroundColor: "#ffffff",
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    padding: 14,
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.18,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: -6 },
+    elevation: 12
+  },
+  sheetHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 10
+  },
+  sheetTitle: {
+    fontSize: 14,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  sheetHeaderRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  sheetBtnGhost: {
+    height: 34,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: "#f1f5f9",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  sheetBtnGhostText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#334155"
+  },
+  sheetBtnPrimary: {
+    height: 34,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: ACCENT_BLUE,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  sheetBtnPrimaryText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#ffffff"
+  },
+  sheetPicker: {
+    marginBottom: 6
+  },
+  fab: {
+    position: "absolute",
+    right: 18,
+    width: 56,
+    height: 56,
+    borderRadius: 18,
+    backgroundColor: ACCENT_BLUE,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.22,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 10
+  },
+  fabText: {
+    fontSize: 28,
+    fontWeight: "900",
+    color: "#ffffff",
+    marginTop: -2
+  },
+  editorSaveBtn: {
+    height: 40,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    backgroundColor: ACCENT_BLUE,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  editorSaveText: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#ffffff"
+  },
+  editorDangerBtn: {
+    height: 40,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    backgroundColor: "#fee2e2",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  editorDangerText: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: ACCENT_RED
   },
   detailCard: {
     flex: 1
