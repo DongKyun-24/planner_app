@@ -1,20 +1,2075 @@
-import { StatusBar } from 'expo-status-bar';
-import { StyleSheet, Text, View } from 'react-native';
+import { useEffect, useMemo, useRef, useState } from "react"
+import Constants from "expo-constants"
+import AsyncStorage from "@react-native-async-storage/async-storage"
+import { createClient } from "@supabase/supabase-js"
+import {
+  ActivityIndicator,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  Pressable,
+  SafeAreaView,
+  ScrollView,
+  SectionList,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View
+} from "react-native"
+import { NavigationContainer } from "@react-navigation/native"
+import { createBottomTabNavigator } from "@react-navigation/bottom-tabs"
+import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context"
+
+const supabaseUrl =
+  Constants.expoConfig?.extra?.supabaseUrl || process.env.EXPO_PUBLIC_SUPABASE_URL || ""
+const supabaseAnonKey =
+  Constants.expoConfig?.extra?.supabaseAnonKey || process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || ""
+
+const supabase =
+  supabaseUrl && supabaseAnonKey
+    ? createClient(supabaseUrl, supabaseAnonKey, {
+        auth: {
+          storage: AsyncStorage,
+          autoRefreshToken: true,
+          persistSession: true,
+          detectSessionInUrl: false
+        }
+      })
+    : null
+
+const Tab = createBottomTabNavigator()
+
+const DEFAULT_WINDOWS = [{ id: "all", title: "통합", color: "#1d4ed8", fixed: true }]
+const AUTH_STORAGE_KEY = "plannerMobile.auth.v1"
+
+function pad2(value) {
+  return String(value).padStart(2, "0")
+}
+
+function dateToKey(year, month, day) {
+  return `${year}-${pad2(month)}-${pad2(day)}`
+}
+
+function parseDateKey(dateKey) {
+  const parts = String(dateKey ?? "").split("-").map((value) => Number(value))
+  if (parts.length !== 3) return null
+  const [year, month, day] = parts
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null
+  return new Date(year, month - 1, day)
+}
+
+function weekdayLabel(dateKey) {
+  const dt = parseDateKey(dateKey)
+  if (!dt) return ""
+  const weekdays = ["일", "월", "화", "수", "목", "금", "토"]
+  return weekdays[dt.getDay()] ?? ""
+}
+
+function weekdayColor(dateKey, { isHoliday } = {}) {
+  if (isHoliday) return "#dc2626"
+  const dt = parseDateKey(dateKey)
+  if (!dt) return "#0f172a"
+  const dow = dt.getDay()
+  if (dow === 0) return "#dc2626"
+  if (dow === 6) return "#2563eb"
+  return "#0f172a"
+}
+
+function formatLine(item) {
+  const time = item?.time ? String(item.time).trim() : ""
+  const text = String(item?.content ?? "").trim()
+  const category = String(item?.category_id ?? "").trim()
+  const prefix = category && category !== "__general__" ? `[${category}] ` : ""
+  return { time, text: `${prefix}${text}`.trim() }
+}
+
+function normalizeWindowTitle(value) {
+  return String(value ?? "").trim()
+}
+
+function timeToMinutes(value) {
+  const trimmed = String(value ?? "").trim()
+  const match = trimmed.match(/^(\d{1,2}):(\d{2})/)
+  if (!match) return Number.MAX_SAFE_INTEGER
+  return Number(match[1]) * 60 + Number(match[2])
+}
+
+function sortItems(a, b) {
+  const ta = timeToMinutes(a?.time)
+  const tb = timeToMinutes(b?.time)
+  if (ta !== tb) return ta - tb
+  const ca = String(a?.category_id ?? "")
+  const cb = String(b?.category_id ?? "")
+  if (ca !== cb) return ca.localeCompare(cb, "ko")
+  const at = String(a?.content ?? "").trim()
+  const bt = String(b?.content ?? "").trim()
+  const aNum = /^\d+$/.test(at) ? Number(at) : null
+  const bNum = /^\d+$/.test(bt) ? Number(bt) : null
+  if (aNum != null && bNum != null) return aNum - bNum
+  return at.localeCompare(bt, "ko")
+}
+
+function Header({
+  title,
+  subtitle,
+  loading,
+  onRefresh,
+  onSignOut,
+  tone = "light",
+  titleStyle,
+  buttonsStyle
+}) {
+  const isDark = tone === "dark"
+  return (
+    <View style={styles.header}>
+      <View>
+        <Text style={[styles.title, isDark ? styles.titleDark : null, titleStyle]}>{title}</Text>
+        {subtitle ? <Text style={[styles.subtitle, isDark ? styles.subtitleDark : null]}>{subtitle}</Text> : null}
+      </View>
+      <View style={[styles.headerButtons, buttonsStyle]}>
+        {onRefresh ? (
+          <TouchableOpacity
+            style={[styles.ghostButton, isDark ? styles.ghostButtonDark : null]}
+            onPress={onRefresh}
+            disabled={loading}
+          >
+            <Text style={[styles.ghostButtonText, isDark ? styles.ghostButtonTextDark : null]}>
+              {loading ? "Refreshing..." : "Refresh"}
+            </Text>
+          </TouchableOpacity>
+        ) : null}
+        {onSignOut ? (
+          <TouchableOpacity style={[styles.ghostButton, isDark ? styles.ghostButtonDark : null]} onPress={onSignOut}>
+            <Text style={[styles.ghostButtonText, isDark ? styles.ghostButtonTextDark : null]}>Sign out</Text>
+          </TouchableOpacity>
+        ) : null}
+      </View>
+    </View>
+  )
+}
+
+function WindowTabs({ windows, activeId, onSelect, tone = "light" }) {
+  const isDark = tone === "dark"
+  return (
+    <View style={[styles.tabBarWrap, isDark ? styles.tabBarWrapDark : null]}>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={[styles.tabScroll, isDark ? styles.tabScrollDark : null]}
+        contentContainerStyle={[styles.tabRow, isDark ? styles.tabRowDark : null]}
+      >
+        {windows.map((w) => {
+          const active = w.id === activeId
+          const label = w.id === "all" ? "\uD1B5\uD569" : w.title
+          return (
+            <TouchableOpacity
+              key={w.id}
+              style={[
+                styles.tabPill,
+                isDark ? styles.tabPillDark : null,
+                active ? (isDark ? styles.tabPillActiveDark : styles.tabPillActive) : null
+              ]}
+              onPress={() => onSelect(w.id)}
+            >
+              {w.id !== "all" ? (
+                <View style={[styles.tabDot, { backgroundColor: w.color || "#3b82f6" }]} />
+              ) : null}
+              <Text style={[
+                styles.tabText,
+                isDark ? styles.tabTextDark : null,
+                active ? (isDark ? styles.tabTextActiveDark : styles.tabTextActive) : null
+              ]}>
+                {label}
+              </Text>
+            </TouchableOpacity>
+          )
+        })}
+      </ScrollView>
+    </View>
+  )
+}
+
+function ListScreen({
+  sections,
+  loading,
+  onRefresh,
+  onSignOut,
+  windows,
+  activeTabId,
+  onSelectTab,
+  holidaysByDate,
+  ensureHolidayYear
+}) {
+  const today = new Date()
+  const [viewYear, setViewYear] = useState(today.getFullYear())
+  const [viewMonth, setViewMonth] = useState(today.getMonth() + 1)
+  const monthLabel = `${viewYear}-${pad2(viewMonth)}`
+  const todayKey = dateToKey(today.getFullYear(), today.getMonth() + 1, today.getDate())
+  const listRef = useRef(null)
+  const pendingScrollRef = useRef(false)
+  const [scrollToken, setScrollToken] = useState(0)
+
+  function scrollToToday() {
+    const index = visibleSections.findIndex((s) => s.title === todayKey)
+    if (index === -1) return false
+    listRef.current?.scrollToLocation?.({
+      sectionIndex: index,
+      itemIndex: 0,
+      viewPosition: 0,
+      viewOffset: 6
+    })
+    return true
+  }
+
+  function goPrevMonth() {
+    const nextMonth = viewMonth - 1
+    if (nextMonth < 1) {
+      setViewYear(viewYear - 1)
+      setViewMonth(12)
+    } else {
+      setViewMonth(nextMonth)
+    }
+  }
+
+  function goNextMonth() {
+    const nextMonth = viewMonth + 1
+    if (nextMonth > 12) {
+      setViewYear(viewYear + 1)
+      setViewMonth(1)
+    } else {
+      setViewMonth(nextMonth)
+    }
+  }
+
+  useEffect(() => {
+    ensureHolidayYear?.(viewYear)
+  }, [viewYear, ensureHolidayYear])
+
+  function goToday() {
+    setViewYear(today.getFullYear())
+    setViewMonth(today.getMonth() + 1)
+    pendingScrollRef.current = true
+    setScrollToken((prev) => prev + 1)
+    setTimeout(() => {
+      if (!scrollToToday()) return
+    }, 80)
+  }
+
+  const visibleSections = useMemo(() => {
+    const prefix = `${viewYear}-${pad2(viewMonth)}-`
+    return (sections ?? []).filter((section) => String(section.title ?? "").startsWith(prefix))
+  }, [sections, viewYear, viewMonth])
+
+  useEffect(() => {
+    if (!pendingScrollRef.current) return
+    if (!scrollToToday()) {
+      pendingScrollRef.current = false
+      return
+    }
+    requestAnimationFrame(() => {
+      scrollToToday()
+      pendingScrollRef.current = false
+    })
+  }, [visibleSections, todayKey, scrollToken])
+
+  return (
+    <SafeAreaView style={[styles.container, styles.calendarFill]}>
+      <Header
+        title="Planner"
+        loading={loading}
+        onRefresh={onRefresh}
+        onSignOut={onSignOut}
+        tone="light"
+        titleStyle={styles.calendarTitleOffset}
+        buttonsStyle={styles.calendarButtonsOffset}
+      />
+      <WindowTabs windows={windows} activeId={activeTabId} onSelect={onSelectTab} tone="light" />
+      <View style={styles.listMonthBar}>
+        <TouchableOpacity style={[styles.calendarNavButton, styles.listMonthLeft]} onPress={goPrevMonth}>
+          <Text style={styles.calendarNavText}>{"<"}</Text>
+        </TouchableOpacity>
+        <Text style={styles.listMonthTextCentered}>{monthLabel}</Text>
+        <View style={styles.listMonthRight}>
+          <TouchableOpacity style={styles.listTodayButton} onPress={goToday}>
+            <Text style={styles.listTodayText}>Today</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.calendarNavButton} onPress={goNextMonth}>
+            <Text style={styles.calendarNavText}>{">"}</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+      <View style={[styles.card, styles.listCard]}>
+        {loading ? <ActivityIndicator size="small" color="#3b82f6" /> : null}
+        <SectionList
+          ref={listRef}
+          sections={visibleSections}
+          keyExtractor={(item) => item.id ?? `${item.date}-${item.content}`}
+          stickySectionHeadersEnabled={false}
+          renderItem={({ item }) => {
+            const { time, text } = formatLine(item)
+            return (
+              <View style={styles.itemRow}>
+                <Text style={time ? styles.itemTime : styles.itemTimeEmpty}>{time || "\u00A0"}</Text>
+                <Text style={styles.itemText}>{text}</Text>
+              </View>
+            )
+          }}
+          renderSectionHeader={({ section }) => {
+            const key = String(section.title ?? "")
+            const holidayName = holidaysByDate?.get?.(key) ?? ""
+            const isHoliday = Boolean(holidayName)
+            const color = weekdayColor(key, { isHoliday })
+            const dow = weekdayLabel(key)
+            return (
+              <View style={[styles.sectionHeader, section.title === todayKey ? styles.sectionHeaderToday : null]}>
+                <View style={styles.sectionHeaderRow}>
+                  <View style={styles.sectionHeaderLeft}>
+                    <Text style={[styles.sectionHeaderDateText, { color }]}>{key}</Text>
+                    {dow ? (
+                      <View
+                        style={[
+                          styles.sectionHeaderDowBadge,
+                          isHoliday ? styles.sectionHeaderDowBadgeHoliday : null,
+                          !isHoliday && dow === "토" ? styles.sectionHeaderDowBadgeSat : null,
+                          !isHoliday && dow === "일" ? styles.sectionHeaderDowBadgeSun : null
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.sectionHeaderDowBadgeText,
+                            isHoliday ? styles.sectionHeaderDowBadgeTextHoliday : null,
+                            !isHoliday && dow === "토" ? styles.sectionHeaderDowBadgeTextSat : null,
+                            !isHoliday && dow === "일" ? styles.sectionHeaderDowBadgeTextSun : null
+                          ]}
+                        >
+                          {dow}
+                        </Text>
+                      </View>
+                    ) : null}
+                  </View>
+                  <View style={styles.sectionHeaderRight}>
+                    {holidayName ? (
+                      <View style={styles.sectionHeaderHolidayBadge}>
+                        <Text numberOfLines={1} style={styles.sectionHeaderHolidayBadgeText}>
+                          {holidayName}
+                        </Text>
+                      </View>
+                    ) : null}
+                  </View>
+                </View>
+              </View>
+            )
+          }}
+          ListEmptyComponent={!loading ? <Text style={styles.helpText}>No items yet.</Text> : null}
+          contentContainerStyle={styles.listContent}
+          onScrollToIndexFailed={({ sectionIndex }) => {
+            setTimeout(() => {
+              listRef.current?.scrollToLocation?.({
+                sectionIndex,
+                itemIndex: 0,
+                viewPosition: 0,
+                viewOffset: 6
+              })
+            }, 250)
+          }}
+        />
+      </View>
+    </SafeAreaView>
+  )
+}
+
+function MemoScreen({ memoText, loading, onRefresh, onSignOut, windows, activeTabId, onSelectTab }) {
+  return (
+    <SafeAreaView style={[styles.container, styles.calendarFill]}>
+      <Header
+        title="Planner"
+        loading={loading}
+        onRefresh={onRefresh}
+        onSignOut={onSignOut}
+        tone="light"
+        titleStyle={styles.calendarTitleOffset}
+        buttonsStyle={styles.calendarButtonsOffset}
+      />
+      <WindowTabs windows={windows} activeId={activeTabId} onSelect={onSelectTab} tone="light" />
+      <View style={[styles.card, styles.memoCard]}>
+        {loading ? <ActivityIndicator size="small" color="#3b82f6" /> : null}
+        <ScrollView contentContainerStyle={styles.memoContent}>
+          {memoText ? (
+            <Text style={styles.memoText}>{memoText}</Text>
+          ) : (
+            <View style={styles.memoEmpty}>
+              <Text style={styles.memoEmptyTitle}>메모가 없습니다</Text>
+              <Text style={styles.memoEmptySub}>오른쪽 메모에 내용을 작성해보세요.</Text>
+            </View>
+          )}
+        </ScrollView>
+      </View>
+    </SafeAreaView>
+  )
+}
+
+function CalendarScreen({
+  itemsByDate,
+  loading,
+  onRefresh,
+  onSignOut,
+  windows,
+  activeTabId,
+  onSelectTab,
+  holidaysByDate,
+  ensureHolidayYear
+}) {
+  const today = new Date()
+  const [viewYear, setViewYear] = useState(today.getFullYear())
+  const [viewMonth, setViewMonth] = useState(today.getMonth() + 1)
+  const [selectedDateKey, setSelectedDateKey] = useState(null)
+  const maxItemsPerDay = 6
+  const [gridHeight, setGridHeight] = useState(0)
+
+  const colorByTitle = useMemo(() => {
+    const map = new Map()
+    for (const w of windows ?? []) {
+      if (!w?.title) continue
+      map.set(w.title, w.color || "#94a3b8")
+    }
+    return map
+  }, [windows])
+
+  const monthLabel = `${viewYear}-${pad2(viewMonth)}`
+  const todayKey = dateToKey(today.getFullYear(), today.getMonth() + 1, today.getDate())
+  const first = new Date(viewYear, viewMonth - 1, 1)
+  const startDay = first.getDay()
+  const daysInMonth = new Date(viewYear, viewMonth, 0).getDate()
+  const totalCells = startDay + daysInMonth
+  const weeks = Math.ceil(totalCells / 7)
+  const cells = []
+  for (let i = 0; i < startDay; i += 1) cells.push(null)
+  for (let d = 1; d <= daysInMonth; d += 1) cells.push(d)
+  while (cells.length < weeks * 7) cells.push(null)
+
+  const cellHeight = gridHeight ? gridHeight / weeks : undefined
+  const dayItems = selectedDateKey ? itemsByDate.get(selectedDateKey) ?? [] : []
+  const selectedDateLabel = useMemo(() => {
+    if (!selectedDateKey) return ""
+    const dt = parseDateKey(selectedDateKey)
+    if (!dt) return selectedDateKey
+    const dayName = weekdayLabel(selectedDateKey)
+    const [y, m, d] = String(selectedDateKey).split("-")
+    return `${y}.${m}.${d}${dayName ? ` (${dayName})` : ""}`
+  }, [selectedDateKey])
+
+  useEffect(() => {
+    ensureHolidayYear?.(viewYear)
+  }, [viewYear, ensureHolidayYear])
+
+
+  function goPrevMonth() {
+    const nextMonth = viewMonth - 1
+    if (nextMonth < 1) {
+      setViewYear(viewYear - 1)
+      setViewMonth(12)
+      return
+    }
+    setViewMonth(nextMonth)
+  }
+
+  function goNextMonth() {
+    const nextMonth = viewMonth + 1
+    if (nextMonth > 12) {
+      setViewYear(viewYear + 1)
+      setViewMonth(1)
+      return
+    }
+    setViewMonth(nextMonth)
+  }
+
+  function openDate(day) {
+    if (!day) return
+    const key = dateToKey(viewYear, viewMonth, day)
+    setSelectedDateKey(key)
+  }
+
+  function goToday() {
+    setViewYear(today.getFullYear())
+    setViewMonth(today.getMonth() + 1)
+  }
+
+  return (
+    <SafeAreaView style={[styles.container, styles.calendarFill]}>
+      <Header
+        title="Planner"
+        loading={loading}
+        onRefresh={onRefresh}
+        onSignOut={onSignOut}
+        tone="light"
+        titleStyle={styles.calendarTitleOffset}
+        buttonsStyle={styles.calendarButtonsOffset}
+      />
+      <WindowTabs windows={windows} activeId={activeTabId} onSelect={onSelectTab} tone="light" />
+      <View style={[styles.card, styles.calendarCard]}>
+          <View style={styles.calendarHeaderWrap}>
+            <View style={styles.calendarHeader}>
+              <TouchableOpacity style={[styles.calendarNavButton, styles.calendarHeaderLeft]} onPress={goPrevMonth}>
+                <Text style={styles.calendarNavText}>{"<"}</Text>
+              </TouchableOpacity>
+              <Text style={styles.calendarTitleCentered}>{monthLabel}</Text>
+              <View style={styles.calendarHeaderRight}>
+                <TouchableOpacity style={styles.listTodayButton} onPress={goToday}>
+                  <Text style={styles.listTodayText}>Today</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.calendarNavButton} onPress={goNextMonth}>
+                  <Text style={styles.calendarNavText}>{">"}</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+            <View style={styles.weekHeaderRow}>
+              {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d, idx) => (
+                <Text key={d + idx} style={styles.weekHeaderText}>
+                  {d}
+                </Text>
+              ))}
+            </View>
+          </View>
+          <View style={styles.calendarGrid} onLayout={(e) => setGridHeight(e.nativeEvent.layout.height)}>
+            {cells.map((day, idx) => {
+              const key = day ? dateToKey(viewYear, viewMonth, day) : null
+              const items = key ? itemsByDate.get(key) ?? [] : []
+              const count = items.length
+              const holidayName = key ? holidaysByDate?.get?.(key) ?? "" : ""
+              const holidayLabel = holidayName ? String(holidayName).trim() : ""
+              const isHoliday = Boolean(holidayName)
+              const maxItemsForCell = holidayLabel ? Math.max(0, maxItemsPerDay - 1) : maxItemsPerDay
+              const visible = items.slice(0, maxItemsForCell)
+              const hiddenCount = Math.max(0, count - visible.length)
+              const col = idx % 7
+              const row = Math.floor(idx / 7)
+              const isSunday = col === 0
+              const isSaturday = col === 6
+              const isLastCol = col === 6
+              const isLastRow = row === weeks - 1
+              const isToday = key === todayKey
+              const isSelected = key && key === selectedDateKey
+            return (
+              <Pressable
+                key={`${idx}-${day ?? "x"}`}
+                style={[
+                  styles.calendarCell,
+                  cellHeight ? { height: cellHeight } : null,
+                  isLastCol ? styles.calendarCellLastCol : null,
+                  isLastRow ? styles.calendarCellLastRow : null,
+                  isToday ? styles.calendarCellToday : null,
+                  isSelected ? styles.calendarCellSelected : null
+                ]}
+                onPress={() => openDate(day)}
+              >
+                <View style={styles.calendarCellHeader}>
+                  <Text
+                    style={[
+                      styles.calendarDay,
+                      day ? null : styles.calendarDayMuted,
+                      isSunday ? styles.calendarDaySunday : null,
+                      isSaturday ? styles.calendarDaySaturday : null,
+                      isToday ? styles.calendarDayToday : null,
+                      isSelected ? styles.calendarDaySelected : null,
+                      isHoliday ? styles.calendarDayHoliday : null
+                    ]}
+                  >
+                    {day ?? ""}
+                  </Text>
+                  {hiddenCount > 0 ? (
+                    <View style={styles.calendarMoreBadge}>
+                      <Text style={styles.calendarMoreText}>+{hiddenCount}</Text>
+                    </View>
+                  ) : null}
+                </View>
+                {holidayLabel ? (
+                  <Text
+                    numberOfLines={1}
+                    adjustsFontSizeToFit
+                    minimumFontScale={0.6}
+                    style={styles.calendarHolidayText}
+                  >
+                    {holidayLabel}
+                  </Text>
+                ) : null}
+                <View style={styles.calendarLineStack}>
+                  {visible.map((item) => {
+                    const line = formatLine(item)
+                    const category = String(item?.category_id ?? "").trim()
+                    const dotColor =
+                      category && category !== "__general__"
+                        ? colorByTitle.get(category) || "#94a3b8"
+                        : "#9aa3b2"
+                    return (
+                      <View key={item.id ?? `${item.date}-${item.content}`} style={styles.calendarLine}>
+                        <View style={[styles.calendarDot, { backgroundColor: dotColor }]} />
+                        <Text numberOfLines={1} style={styles.calendarLineText}>
+                          {line.text}
+                        </Text>
+                      </View>
+                    )
+                  })}
+                </View>
+              </Pressable>
+            )
+          })}
+        </View>
+      </View>
+    
+      <Modal
+        visible={Boolean(selectedDateKey)}
+        transparent
+        presentationStyle="overFullScreen"
+        statusBarTranslucent
+        animationType="fade"
+        onRequestClose={() => setSelectedDateKey(null)}
+      >
+        <View style={styles.dayModalOverlay}>
+          <Pressable style={styles.dayModalBackdrop} onPress={() => setSelectedDateKey(null)} />
+          <View style={styles.dayModalCard}>
+            <View style={styles.dayModalHeader}>
+              <View style={styles.dayModalHeaderLeft}>
+                <Text style={styles.dayModalTitle}>{selectedDateLabel || selectedDateKey}</Text>
+                <View style={styles.dayModalCountPill}>
+                  <Text style={styles.dayModalCountText}>{dayItems.length}개</Text>
+                </View>
+              </View>
+              <Pressable onPress={() => setSelectedDateKey(null)} style={styles.dayModalCloseBtn}>
+                <Text style={styles.dayModalCloseX}>닫기</Text>
+              </Pressable>
+            </View>
+            <ScrollView contentContainerStyle={styles.dayModalList}>
+              {dayItems.length === 0 ? (
+                <View style={styles.dayModalEmpty}>
+                  <Text style={styles.dayModalEmptyTitle}>할 일이 없어요</Text>
+                  <Text style={styles.dayModalEmptySub}>이 날짜에 등록된 일정이 없습니다.</Text>
+                </View>
+              ) : (
+                dayItems.map((item) => {
+                  const line = formatLine(item)
+                  const time = item?.time ? String(item.time).trim() : ""
+                  return (
+                    <View key={item.id ?? `${item.date}-${item.content}`} style={styles.dayModalItemRow}>
+                      {time ? (
+                        <Text style={styles.dayModalItemTime}>{time}</Text>
+                      ) : (
+                        <Text style={styles.dayModalItemTimeEmpty}>{"\u00A0"}</Text>
+                      )}
+                      <Text style={styles.dayModalItemText}>{line.text}</Text>
+                    </View>
+                  )
+                })
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  )
+}
+
+function AppInner() {
+  const insets = useSafeAreaInsets()
+  const tabBarStyle = useMemo(
+    () => [
+      styles.tabBar,
+      {
+        height: 50 + insets.bottom,
+        paddingBottom: Math.max(insets.bottom, 6)
+      }
+    ],
+    [insets.bottom]
+  )
+
+  const [session, setSession] = useState(null)
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [authLoading, setAuthLoading] = useState(false)
+  const [authMessage, setAuthMessage] = useState("")
+  const [authMessageTone, setAuthMessageTone] = useState("error")
+  const [authMode, setAuthMode] = useState("signin")
+  const [rememberCreds, setRememberCreds] = useState(false)
+  const [authReady, setAuthReady] = useState(false)
+  const authDraftTimerRef = useRef(null)
+  const [plans, setPlans] = useState([])
+  const [windows, setWindows] = useState(DEFAULT_WINDOWS)
+  const [activeTabId, setActiveTabId] = useState("all")
+  const [rightMemos, setRightMemos] = useState({})
+  const [loading, setLoading] = useState(false)
+  const [holidaysByDate, setHolidaysByDate] = useState(() => new Map())
+  const holidayYearCacheRef = useRef(new Map())
+  const holidayInflightRef = useRef(new Map())
+
+  const memoYear = new Date().getFullYear()
+
+  async function fetchHolidayYear(year) {
+    const res = await fetch(`https://date.nager.at/api/v3/PublicHolidays/${year}/KR`)
+    if (!res.ok) throw new Error(`Holiday fetch failed (${res.status})`)
+    const data = await res.json()
+    const map = new Map()
+    for (const row of data ?? []) {
+      const date = String(row?.date ?? "")
+      if (!date) continue
+      const localName = String(row?.localName ?? "").trim()
+      const name = String(row?.name ?? "").trim()
+      map.set(date, localName || name || "Holiday")
+    }
+    return map
+  }
+
+  const ensureHolidayYear = useMemo(() => {
+    return async (year) => {
+      const y = Number(year)
+      if (!Number.isFinite(y)) return
+      if (holidayYearCacheRef.current.has(y)) return
+      if (holidayInflightRef.current.has(y)) return holidayInflightRef.current.get(y)
+
+      const promise = (async () => {
+        try {
+          const map = await fetchHolidayYear(y)
+          holidayYearCacheRef.current.set(y, map)
+          setHolidaysByDate((prev) => {
+            const next = new Map(prev)
+            for (const [key, value] of map.entries()) next.set(key, value)
+            return next
+          })
+        } catch (_err) {
+          // ignore
+        } finally {
+          holidayInflightRef.current.delete(y)
+        }
+      })()
+
+      holidayInflightRef.current.set(y, promise)
+      return promise
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!supabase) return
+    let mounted = true
+    supabase.auth.getSession().then(({ data }) => {
+      if (!mounted) return
+      setSession(data.session ?? null)
+    })
+    const {
+      data: { subscription }
+    } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession ?? null)
+    })
+    return () => {
+      mounted = false
+      subscription.unsubscribe()
+    }
+  }, [])
+
+  useEffect(() => {
+    ensureHolidayYear?.(new Date().getFullYear())
+  }, [ensureHolidayYear])
+
+  useEffect(() => {
+    let mounted = true
+    async function hydrate() {
+      try {
+        const raw = await AsyncStorage.getItem(AUTH_STORAGE_KEY)
+        if (!mounted) return
+        if (!raw) {
+          setAuthReady(true)
+          return
+        }
+        const parsed = JSON.parse(raw)
+        const remember = Boolean(parsed?.remember)
+        setRememberCreds(remember)
+        if (remember) {
+          if (typeof parsed?.email === "string") setEmail(parsed.email)
+          if (typeof parsed?.password === "string") setPassword(parsed.password)
+        }
+      } catch (_err) {
+        // ignore
+      } finally {
+        if (mounted) setAuthReady(true)
+      }
+    }
+    hydrate()
+    return () => {
+      mounted = false
+    }
+  }, [])
+
+  async function persistAuthDraft(next) {
+    try {
+      if (!next?.remember) {
+        await AsyncStorage.removeItem(AUTH_STORAGE_KEY)
+        return
+      }
+      await AsyncStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(next))
+    } catch (_err) {
+      // ignore
+    }
+  }
+
+  useEffect(() => {
+    if (!authReady) return
+    if (!rememberCreds) return
+    if (authDraftTimerRef.current) clearTimeout(authDraftTimerRef.current)
+    authDraftTimerRef.current = setTimeout(() => {
+      persistAuthDraft({ remember: true, email, password })
+    }, 250)
+    return () => {
+      if (authDraftTimerRef.current) clearTimeout(authDraftTimerRef.current)
+    }
+  }, [email, password, rememberCreds, authReady])
+
+  useEffect(() => {
+    if (!supabase || !session?.user?.id) return
+    loadPlans(session.user.id)
+    loadWindows(session.user.id)
+    loadRightMemos(session.user.id, memoYear)
+  }, [session?.user?.id])
+
+  async function loadPlans(userId) {
+    if (!supabase || !userId) return
+    setLoading(true)
+    const { data, error } = await supabase
+      .from("plans")
+      .select("*")
+      .eq("user_id", userId)
+      .is("deleted_at", null)
+      .order("date", { ascending: true })
+      .order("time", { ascending: true })
+    if (error) {
+      setAuthMessage(error.message || "Load failed.")
+      setPlans([])
+    } else {
+      setPlans(data ?? [])
+    }
+    setLoading(false)
+  }
+
+  async function loadWindows(userId) {
+    if (!supabase || !userId) return
+    const { data, error } = await supabase
+      .from("windows")
+      .select("*")
+      .eq("user_id", userId)
+      .order("sort_order", { ascending: true })
+    if (error) return
+    const normalized = (data ?? [])
+      .filter((row) => row && row.title)
+      .map((row) => ({
+        id: row.id,
+        title: normalizeWindowTitle(row.title),
+        color: typeof row.color === "string" ? row.color : "#3b82f6",
+        fixed: Boolean(row.is_fixed)
+      }))
+    const next = [DEFAULT_WINDOWS[0], ...normalized]
+    setWindows(next)
+    if (!next.find((w) => w.id === activeTabId)) setActiveTabId("all")
+  }
+
+  async function loadRightMemos(userId, year) {
+    if (!supabase || !userId) return
+    const { data, error } = await supabase
+      .from("right_memos")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("year", year)
+    if (error) return
+    const map = {}
+    for (const row of data ?? []) {
+      if (!row?.window_id) continue
+      map[row.window_id] = String(row?.content ?? "")
+    }
+    setRightMemos(map)
+  }
+
+  async function handleSignIn() {
+    if (!supabase) return
+    setAuthMessage("")
+    setAuthMessageTone("error")
+    setAuthLoading(true)
+    const result = await supabase.auth.signInWithPassword({ email, password })
+    if (result?.error) {
+      setAuthMessage(result.error.message)
+    } else {
+      await persistAuthDraft({ remember: rememberCreds, email, password: rememberCreds ? password : "" })
+    }
+    setAuthLoading(false)
+  }
+
+  async function handleSignUp() {
+    if (!supabase) return
+    setAuthMessage("")
+    setAuthMessageTone("error")
+    setAuthLoading(true)
+    const result = await supabase.auth.signUp({ email, password })
+    if (result?.error) {
+      setAuthMessage(result.error.message)
+    } else {
+      await persistAuthDraft({ remember: rememberCreds, email, password: rememberCreds ? password : "" })
+      setAuthMessageTone("info")
+      setAuthMessage("가입이 완료됐어요. 이메일 인증이 필요할 수 있어요.")
+      setAuthMode("signin")
+    }
+    setAuthLoading(false)
+  }
+
+  async function handleSignOut() {
+    if (!supabase) return
+    await supabase.auth.signOut()
+  }
+
+  const activeTitle = useMemo(() => {
+    if (activeTabId === "all") return null
+    return windows.find((w) => w.id === activeTabId)?.title ?? null
+  }, [windows, activeTabId])
+
+  const filteredPlans = useMemo(() => {
+    if (!activeTitle) return plans
+    return (plans ?? []).filter((row) => String(row?.category_id ?? "").trim() === activeTitle)
+  }, [plans, activeTitle])
+
+  const sections = useMemo(() => {
+    const map = new Map()
+    for (const row of filteredPlans ?? []) {
+      const key = String(row?.date ?? "no-date")
+      if (!map.has(key)) map.set(key, [])
+      map.get(key).push(row)
+    }
+    const keys = [...map.keys()].sort()
+    return keys.map((key) => ({
+      title: key,
+      data: [...(map.get(key) ?? [])].sort(sortItems)
+    }))
+  }, [filteredPlans])
+
+  const itemsByDate = useMemo(() => {
+    const map = new Map()
+    for (const row of filteredPlans ?? []) {
+      const key = String(row?.date ?? "no-date")
+      if (!map.has(key)) map.set(key, [])
+      map.get(key).push(row)
+    }
+    for (const [key, items] of map.entries()) {
+      map.set(key, [...items].sort(sortItems))
+    }
+    return map
+  }, [filteredPlans])
+
+  const memoText = useMemo(() => {
+    if (activeTabId !== "all") return rightMemos[activeTabId] ?? ""
+    const chunks = []
+    for (const w of windows) {
+      if (w.id === "all") continue
+      const content = String(rightMemos[w.id] ?? "").trim()
+      if (content) chunks.push(`[${w.title}]\n${content}`)
+      else chunks.push(`[${w.title}]`)
+    }
+    return chunks.join("\n\n")
+  }, [rightMemos, activeTabId, windows])
+
+  if (!supabase) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <Text style={styles.title}>Planner Mobile</Text>
+        <Text style={styles.errorText}>Supabase config missing.</Text>
+        <Text style={styles.helpText}>Set supabaseUrl and supabaseAnonKey in app.json.</Text>
+      </SafeAreaView>
+    )
+  }
+
+  if (!session) {
+    return (
+      <SafeAreaView style={[styles.container, styles.authScreen]}>
+        <KeyboardAvoidingView
+          style={styles.authFlex}
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          keyboardVerticalOffset={Platform.OS === "ios" ? 8 : 0}
+        >
+          <ScrollView
+            contentContainerStyle={styles.authScroll}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
+            <View style={styles.authHero}>
+              <View style={styles.authLogo}>
+                <Text style={styles.authLogoText}>P</Text>
+              </View>
+              <Text style={styles.authHeadline}>Planner Mobile</Text>
+              <Text style={styles.authTagline}>로그인해서 내 일정을 동기화하세요.</Text>
+            </View>
+
+            <View style={styles.authCard}>
+              <View style={styles.authModeRow}>
+                <Pressable
+                  onPress={() => setAuthMode("signin")}
+                  style={[styles.authModePill, authMode === "signin" ? styles.authModePillActive : null]}
+                >
+                  <Text style={[styles.authModeText, authMode === "signin" ? styles.authModeTextActive : null]}>
+                    로그인
+                  </Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => setAuthMode("signup")}
+                  style={[styles.authModePill, authMode === "signup" ? styles.authModePillActive : null]}
+                >
+                  <Text style={[styles.authModeText, authMode === "signup" ? styles.authModeTextActive : null]}>
+                    가입
+                  </Text>
+                </Pressable>
+              </View>
+
+              <View style={styles.authField}>
+                <Text style={styles.authLabel}>이메일</Text>
+                <TextInput
+                  value={email}
+                  onChangeText={setEmail}
+                  autoCapitalize="none"
+                  keyboardType="email-address"
+                  placeholder="example@email.com"
+                  placeholderTextColor="#9aa3b2"
+                  style={[styles.input, styles.authInput]}
+                />
+              </View>
+
+              <View style={styles.authField}>
+                <Text style={styles.authLabel}>비밀번호</Text>
+                <TextInput
+                  value={password}
+                  onChangeText={setPassword}
+                  secureTextEntry
+                  placeholder="••••••••"
+                  placeholderTextColor="#9aa3b2"
+                  style={[styles.input, styles.authInput]}
+                />
+              </View>
+
+              <Pressable
+                style={styles.rememberRow}
+                onPress={() => {
+                  const next = !rememberCreds
+                  setRememberCreds(next)
+                  if (next) persistAuthDraft({ remember: true, email, password })
+                  else persistAuthDraft({ remember: false })
+                }}
+                disabled={!authReady}
+              >
+                <View style={[styles.checkbox, rememberCreds ? styles.checkboxChecked : null]}>
+                  {rememberCreds ? <Text style={styles.checkboxTick}>✓</Text> : null}
+                </View>
+                <Text style={styles.rememberText}>아이디/비번 저장</Text>
+              </Pressable>
+
+              <TouchableOpacity
+                style={[styles.primaryButton, styles.authPrimaryButton]}
+                onPress={authMode === "signup" ? handleSignUp : handleSignIn}
+                disabled={authLoading || !email || !password}
+              >
+                <Text style={styles.primaryButtonText}>
+                  {authLoading ? "처리 중..." : authMode === "signup" ? "가입하기" : "로그인"}
+                </Text>
+              </TouchableOpacity>
+
+              <View style={styles.authAltRow}>
+                <Text style={styles.authAltText}>
+                  {authMode === "signup" ? "이미 계정이 있어요." : "계정이 없나요?"}
+                </Text>
+                <Pressable
+                  onPress={() => setAuthMode(authMode === "signup" ? "signin" : "signup")}
+                  style={styles.authAltBtn}
+                >
+                  <Text style={styles.authAltBtnText}>{authMode === "signup" ? "로그인" : "가입하기"}</Text>
+                </Pressable>
+              </View>
+
+              {authMessage ? (
+                <Text style={[styles.authMessage, authMessageTone === "info" ? styles.authMessageInfo : null]}>
+                  {authMessage}
+                </Text>
+              ) : null}
+            </View>
+
+            <Text style={styles.authFooterNote}>비밀번호 저장은 기기 분실 시 위험할 수 있어요.</Text>
+          </ScrollView>
+        </KeyboardAvoidingView>
+      </SafeAreaView>
+    )
+  }
+
+  return (
+    <NavigationContainer>
+      <Tab.Navigator
+        screenOptions={({ route }) => ({
+          headerShown: false,
+          tabBarStyle,
+          tabBarLabelStyle: styles.tabLabel,
+          tabBarItemStyle: styles.tabItem,
+          tabBarActiveTintColor: "#1d4ed8",
+          tabBarInactiveTintColor: "#94a3b8",
+          tabBarHideOnKeyboard: true,
+          tabBarIcon: ({ focused }) => {
+            const glyph = route.name === "List" ? "≡" : route.name === "Memo" ? "✎" : "▦"
+            return <Text style={[styles.tabIcon, focused ? styles.tabIconActive : null]}>{glyph}</Text>
+          }
+        })}
+      >
+        <Tab.Screen name="List">
+          {() => (
+            <ListScreen
+              sections={sections}
+              loading={loading}
+              windows={windows}
+              activeTabId={activeTabId}
+              onSelectTab={setActiveTabId}
+              holidaysByDate={holidaysByDate}
+              ensureHolidayYear={ensureHolidayYear}
+              onRefresh={() => {
+                loadPlans(session?.user?.id)
+                loadWindows(session?.user?.id)
+                loadRightMemos(session?.user?.id, memoYear)
+              }}
+              onSignOut={handleSignOut}
+            />
+          )}
+        </Tab.Screen>
+        <Tab.Screen name="Memo">
+          {() => (
+            <MemoScreen
+              memoText={memoText}
+              loading={loading}
+              windows={windows}
+              activeTabId={activeTabId}
+              onSelectTab={setActiveTabId}
+              onRefresh={() => {
+                loadPlans(session?.user?.id)
+                loadWindows(session?.user?.id)
+                loadRightMemos(session?.user?.id, memoYear)
+              }}
+              onSignOut={handleSignOut}
+            />
+          )}
+        </Tab.Screen>
+        <Tab.Screen name="Calendar">
+          {() => (
+            <CalendarScreen
+              itemsByDate={itemsByDate}
+              loading={loading}
+              windows={windows}
+              activeTabId={activeTabId}
+              onSelectTab={setActiveTabId}
+              holidaysByDate={holidaysByDate}
+              ensureHolidayYear={ensureHolidayYear}
+              onRefresh={() => {
+                loadPlans(session?.user?.id)
+                loadWindows(session?.user?.id)
+                loadRightMemos(session?.user?.id, memoYear)
+              }}
+              onSignOut={handleSignOut}
+            />
+          )}
+        </Tab.Screen>
+      </Tab.Navigator>
+    </NavigationContainer>
+  )
+}
 
 export default function App() {
   return (
-    <View style={styles.container}>
-      <Text>Open up App.js to start working on your app!</Text>
-      <StatusBar style="auto" />
-    </View>
-  );
+    <SafeAreaProvider>
+      <AppInner />
+    </SafeAreaProvider>
+  )
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#fff',
-    alignItems: 'center',
-    justifyContent: 'center',
+    backgroundColor: "#f5f7fb",
+    paddingTop: 9,
+    paddingHorizontal: 9,
+    paddingBottom: 0
   },
-});
+  tabBar: {
+    paddingTop: 2,
+    borderTopWidth: 1,
+    borderTopColor: "transparent",
+    backgroundColor: "#f8fafc",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.4,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: -3 },
+    elevation: 10
+  },
+  tabItem: {
+    paddingVertical: 2
+  },
+  tabLabel: {
+    fontSize: 11,
+    fontWeight: "800",
+    marginTop: -2
+  },
+  tabIcon: {
+    fontSize: 18,
+    fontWeight: "800",
+    color: "#94a3b8"
+  },
+  tabIconActive: {
+    color: "#1d4ed8"
+  },
+  authScreen: {
+    paddingTop: 0,
+    paddingBottom: 0
+  },
+  authFlex: {
+    flex: 1
+  },
+  authScroll: {
+    flexGrow: 1,
+    justifyContent: "center",
+    paddingHorizontal: 16,
+    paddingVertical: 22
+  },
+  authHero: {
+    alignItems: "center",
+    marginBottom: 14
+  },
+  authLogo: {
+    width: 56,
+    height: 56,
+    borderRadius: 18,
+    backgroundColor: "#1d4ed8",
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.18,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 6
+  },
+  authLogoText: {
+    color: "#ffffff",
+    fontWeight: "900",
+    fontSize: 22
+  },
+  authHeadline: {
+    marginTop: 10,
+    fontSize: 22,
+    fontWeight: "800",
+    color: "#0f172a"
+  },
+  authTagline: {
+    marginTop: 6,
+    fontSize: 13,
+    color: "#64748b"
+  },
+  authCard: {
+    width: "100%",
+    maxWidth: 520,
+    alignSelf: "center",
+    backgroundColor: "#ffffff",
+    borderRadius: 16,
+    padding: 16,
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.05,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 2
+  },
+  authModeRow: {
+    flexDirection: "row",
+    gap: 8,
+    padding: 4,
+    borderRadius: 14,
+    backgroundColor: "#f1f5f9",
+    marginBottom: 14
+  },
+  authModePill: {
+    flex: 1,
+    height: 36,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  authModePillActive: {
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#dbe3f0"
+  },
+  authModeText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#64748b"
+  },
+  authModeTextActive: {
+    color: "#0f172a"
+  },
+  authField: {
+    marginBottom: 12
+  },
+  authLabel: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#334155",
+    marginBottom: 6
+  },
+  authInput: {
+    marginBottom: 0
+  },
+  rememberRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginTop: 6,
+    marginBottom: 12
+  },
+  checkbox: {
+    width: 20,
+    height: 20,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: "#cbd5e1",
+    backgroundColor: "#ffffff",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  checkboxChecked: {
+    backgroundColor: "#1d4ed8",
+    borderColor: "#1d4ed8"
+  },
+  checkboxTick: {
+    color: "#ffffff",
+    fontSize: 12,
+    fontWeight: "900",
+    marginTop: -1
+  },
+  rememberText: {
+    fontSize: 12,
+    color: "#475569",
+    fontWeight: "700"
+  },
+  authPrimaryButton: {
+    marginTop: 2
+  },
+  authAltRow: {
+    marginTop: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6
+  },
+  authAltText: {
+    fontSize: 12,
+    color: "#64748b"
+  },
+  authAltBtn: {
+    paddingHorizontal: 6,
+    paddingVertical: 4
+  },
+  authAltBtnText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#1d4ed8"
+  },
+  authMessage: {
+    marginTop: 12,
+    fontSize: 12,
+    color: "#dc2626",
+    fontWeight: "700",
+    textAlign: "center"
+  },
+  authMessageInfo: {
+    color: "#1d4ed8"
+  },
+  authFooterNote: {
+    marginTop: 14,
+    textAlign: "center",
+    fontSize: 11,
+    color: "#94a3b8"
+  },
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 12,
+    marginTop: 8
+  },
+  headerButtons: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  title: {
+    fontSize: 22,
+    fontWeight: "700",
+    color: "#0f172a"
+  },
+  subtitle: {
+    fontSize: 12,
+    color: "#64748b",
+    marginTop: 2
+  },
+  titleDark: {
+    color: "#f8fafc"
+  },
+  subtitleDark: {
+    color: "#9aa0aa"
+  },
+  tabBarWrap: {
+    marginTop: 4,
+    marginBottom: 4,
+    padding: 3,
+    borderRadius: 10,
+    backgroundColor: "#eef2f7",
+    borderWidth: 0
+  },
+  tabBarWrapDark: {
+    backgroundColor: "#1f2937",
+    borderWidth: 0
+  },
+  tabRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingVertical: 1,
+    paddingHorizontal: 1
+  },
+  tabScroll: {
+    maxHeight: 44
+  },
+  tabRowDark: {},
+  tabScrollDark: {
+    maxHeight: 44
+  },
+  listMonthBar: {
+    marginTop: 0,
+    marginBottom: 4,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 4,
+    position: "relative",
+    height: 34
+  },
+  listMonthLeft: {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    bottom: 0,
+    justifyContent: "center"
+  },
+  listMonthRight: {
+    position: "absolute",
+    right: 0,
+    top: 0,
+    bottom: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6
+  },
+  listMonthTextCentered: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    textAlign: "center",
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#0f172a"
+  },
+  listTodayButton: {
+    height: 28,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: "#eef2ff",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  listTodayText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#1d4ed8"
+  },
+  tabPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    height: 34,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    backgroundColor: "transparent"
+  },
+  tabPillActive: {
+    backgroundColor: "#ffffff",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.06,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 2
+  },
+  tabPillDark: {
+    backgroundColor: "transparent"
+  },
+  tabPillActiveDark: {
+    backgroundColor: "#111827"
+  },
+  tabText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#64748b"
+  },
+  tabTextActive: {
+    color: "#0f172a"
+  },
+  tabTextDark: {
+    color: "#9ca3af"
+  },
+  tabTextActiveDark: {
+    color: "#f8fafc"
+  },
+  tabDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 999
+  },
+  card: {
+    flex: 1,
+    backgroundColor: "#ffffff",
+    borderRadius: 16,
+    padding: 16,
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.05,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 2
+  },
+  listCard: {
+    padding: 0,
+    borderBottomLeftRadius: 0,
+    borderBottomRightRadius: 0
+  },
+  memoCard: {
+    padding: 0,
+    borderBottomLeftRadius: 0,
+    borderBottomRightRadius: 0
+  },
+  input: {
+    height: 44,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#d6dbe6",
+    paddingHorizontal: 12,
+    fontSize: 14,
+    color: "#0f172a",
+    marginBottom: 10
+  },
+  primaryButton: {
+    height: 46,
+    borderRadius: 12,
+    backgroundColor: "#3b82f6",
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 6
+  },
+  primaryButtonText: {
+    color: "#ffffff",
+    fontWeight: "700"
+  },
+  ghostButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: "#eef2ff"
+  },
+  ghostButtonText: {
+    color: "#1d4ed8",
+    fontWeight: "600"
+  },
+  ghostButtonDark: {
+    backgroundColor: "#22252b"
+  },
+  ghostButtonTextDark: {
+    color: "#e5e7eb"
+  },
+  errorText: {
+    color: "#dc2626",
+    fontSize: 12,
+    marginTop: 8
+  },
+  helpText: {
+    color: "#64748b",
+    fontSize: 12,
+    marginTop: 8
+  },
+  sectionHeader: {
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    marginTop: 10
+  },
+  sectionHeaderToday: {
+    backgroundColor: "#eef2ff"
+  },
+  sectionHeaderDateText: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  sectionHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10
+  },
+  sectionHeaderLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  sectionHeaderRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  sectionHeaderDowBadge: {
+    minWidth: 26,
+    height: 22,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    backgroundColor: "rgba(100, 116, 139, 0.10)",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  sectionHeaderDowBadgeSun: {
+    backgroundColor: "rgba(220, 38, 38, 0.10)"
+  },
+  sectionHeaderDowBadgeSat: {
+    backgroundColor: "rgba(37, 99, 235, 0.10)"
+  },
+  sectionHeaderDowBadgeHoliday: {
+    backgroundColor: "rgba(220, 38, 38, 0.10)"
+  },
+  sectionHeaderDowBadgeText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#475569"
+  },
+  sectionHeaderDowBadgeTextSun: {
+    color: "#dc2626"
+  },
+  sectionHeaderDowBadgeTextSat: {
+    color: "#2563eb"
+  },
+  sectionHeaderDowBadgeTextHoliday: {
+    color: "#dc2626"
+  },
+  sectionHeaderHolidayBadge: {
+    maxWidth: 180,
+    height: 22,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    backgroundColor: "rgba(220, 38, 38, 0.10)",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  sectionHeaderHolidayBadgeText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#dc2626"
+  },
+  listContent: {
+    paddingBottom: 12,
+    paddingHorizontal: 10,
+    paddingTop: 2
+  },
+  itemRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#eef2f7"
+  },
+  itemTime: {
+    width: 58,
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#334155"
+  },
+  itemTimeEmpty: {
+    width: 58,
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#94a3b8"
+  },
+  itemText: {
+    flex: 1,
+    fontSize: 13,
+    color: "#0f172a"
+  },
+  memoContent: {
+    paddingTop: 8,
+    paddingBottom: 12,
+    paddingHorizontal: 16
+  },
+  memoPaper: {
+    backgroundColor: "#ffffff",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#eef2f7",
+    padding: 14,
+    minHeight: 240
+  },
+  memoText: {
+    fontSize: 14,
+    lineHeight: 20,
+    color: "#0f172a"
+  },
+  memoEmpty: {
+    minHeight: 240,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  memoEmptyTitle: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#0f172a"
+  },
+  memoEmptySub: {
+    marginTop: 6,
+    fontSize: 12,
+    color: "#64748b"
+  },
+  calendarHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 8,
+    position: "relative",
+    width: "100%",
+    height: 34
+  },
+  calendarHeaderLeft: {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    bottom: 0,
+    justifyContent: "center"
+  },
+  calendarTitleCentered: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    textAlign: "center",
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#0f172a"
+  },
+  calendarHeaderRight: {
+    position: "absolute",
+    right: 0,
+    top: 0,
+    bottom: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6
+  },
+  calendarCard: {
+    flex: 1,
+    marginBottom: 0,
+    padding: 0,
+    overflow: "hidden",
+    borderColor: "#cbd5f5",
+    borderBottomLeftRadius: 0,
+    borderBottomRightRadius: 0
+  },
+  calendarHeaderWrap: {
+    paddingTop: 8,
+    paddingBottom: 6,
+    paddingHorizontal: 0,
+    backgroundColor: "#ffffff"
+  },
+  calendarFill: {
+    paddingTop: 2,
+    paddingHorizontal: 2,
+    paddingBottom: 0
+  },
+  calendarButtonsOffset: {
+    marginTop: 28
+  },
+  calendarTitleOffset: {
+    marginTop: 28,
+    marginLeft: 10,
+    paddingTop: 2
+  },
+  calendarNavButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    backgroundColor: "#f1f5ff",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  calendarNavText: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#1d4ed8"
+  },
+  calendarTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#0f172a"
+  },
+  weekHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 2,
+    marginTop: 2,
+    paddingVertical: 2,
+    backgroundColor: "#f8fafc",
+    borderRadius: 6
+  },
+  weekHeaderText: {
+    width: "14.285%",
+    textAlign: "center",
+    fontSize: 11,
+    color: "#64748b",
+    fontWeight: "600"
+  },
+  calendarGrid: {
+    flex: 1,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    borderWidth: 1,
+    borderColor: "#dbe3f0",
+    borderTopWidth: 0
+  },
+  calendarCell: {
+    width: "14.285%",
+    borderRightWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: "#e2e8f0",
+    padding: 4,
+    alignItems: "flex-start",
+    justifyContent: "flex-start"
+  },
+  calendarCellToday: {
+    backgroundColor: "#eef2ff"
+  },
+  calendarCellSelected: {
+    backgroundColor: "#dbeafe"
+  },
+  calendarCellLastCol: {
+    borderRightWidth: 0
+  },
+  calendarCellLastRow: {
+    borderBottomWidth: 0
+  },
+  calendarCellHeader: {
+    width: "100%",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
+  },
+  calendarDay: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: "#0f172a"
+  },
+  calendarDayToday: {
+    color: "#1d4ed8"
+  },
+  calendarDaySelected: {
+    color: "#1e40af"
+  },
+  calendarDayMuted: {
+    color: "#cbd5f5"
+  },
+  calendarDaySunday: {
+    color: "#dc2626"
+  },
+  calendarDaySaturday: {
+    color: "#2563eb"
+  },
+  calendarDayHoliday: {
+    color: "#dc2626"
+  },
+  calendarHolidayText: {
+    width: "100%",
+    marginTop: 2,
+    fontSize: 8,
+    fontWeight: "800",
+    color: "#dc2626",
+    lineHeight: 10,
+    textAlign: "left"
+  },
+  calendarLineStack: {
+    width: "100%",
+    gap: 1,
+    marginTop: 4
+  },
+  calendarLine: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4
+  },
+  calendarDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 999
+  },
+  calendarLineText: {
+    flex: 1,
+    fontSize: 8,
+    lineHeight: 10,
+    color: "#1f2937"
+  },
+  calendarMoreBadge: {
+    alignSelf: "flex-start",
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#c7d2fe",
+    backgroundColor: "#eef2ff"
+  },
+  calendarMoreText: {
+    fontSize: 8,
+    fontWeight: "700",
+    color: "#1d4ed8"
+  },
+  dayModalOverlay: {
+    flex: 1,
+    width: "100%",
+    height: "100%",
+    backgroundColor: "rgba(15, 23, 42, 0.45)",
+    padding: 16,
+    justifyContent: "center",
+    alignItems: "center"
+  },
+  dayModalBackdrop: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0
+  },
+  dayModalCard: {
+    width: "92%",
+    alignSelf: "center",
+    maxWidth: 520,
+    maxHeight: "78%",
+    backgroundColor: "#ffffff",
+    borderRadius: 16,
+    padding: 16,
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.12,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 6
+  },
+  dayModalHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 10
+  },
+  dayModalHeaderLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  dayModalTitle: {
+    fontSize: 16,
+    fontWeight: "800",
+    color: "#0f172a"
+  },
+  dayModalCountPill: {
+    paddingHorizontal: 10,
+    height: 24,
+    borderRadius: 999,
+    backgroundColor: "#eef2ff",
+    borderWidth: 1,
+    borderColor: "#c7d2fe",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  dayModalCountText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#1d4ed8"
+  },
+  dayModalCloseBtn: {
+    height: 32,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: "#f1f5f9",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  dayModalCloseX: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#334155"
+  },
+  dayModalList: {
+    paddingBottom: 6
+  },
+  dayModalEmpty: {
+    paddingVertical: 30,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  dayModalEmptyTitle: {
+    fontSize: 14,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  dayModalEmptySub: {
+    marginTop: 6,
+    fontSize: 12,
+    color: "#64748b"
+  },
+  dayModalItemRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#eef2f7"
+  },
+  dayModalItemTime: {
+    width: 62,
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#334155"
+  },
+  dayModalItemTimeEmpty: {
+    width: 62,
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#94a3b8"
+  },
+  dayModalItemText: {
+    flex: 1,
+    fontSize: 13,
+    color: "#0f172a"
+  },
+  detailCard: {
+    flex: 1
+  },
+  detailHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
+  },
+  detailTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#0f172a"
+  },
+  detailBody: {
+    paddingTop: 12,
+    paddingBottom: 12
+  }
+})
+
