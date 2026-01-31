@@ -258,7 +258,16 @@ function Header({
       <View style={styles.headerLeft}>
         {showLogo ? <LogoMark tone={tone} size={38} /> : null}
         <View style={!showLogo ? styles.headerTitleWrapNoLogo : null}>
-          <Text style={[styles.title, isDark ? styles.titleDark : null, titleStyle]}>{title}</Text>
+          <Text
+            style={[
+              styles.title,
+              isDark ? styles.titleDark : null,
+              titleStyle,
+              !showLogo ? styles.headerTitleTranslateDown : null
+            ]}
+          >
+            {title}
+          </Text>
           <Text style={[styles.subtitle, isDark ? styles.subtitleDark : null]}>
             {subtitle ?? "for users who like typing"}
           </Text>
@@ -2914,6 +2923,9 @@ const styles = StyleSheet.create({
   },
   headerTitleWrapNoLogo: {
     paddingLeft: 15
+  },
+  headerTitleTranslateDown: {
+    transform: [{ translateY: 2 }]
   },
   headerLogo: {
     width: 38,
