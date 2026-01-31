@@ -222,6 +222,25 @@ function sortItems(a, b) {
   return at.localeCompare(bt, "ko")
 }
 
+function LogoMark({ tone = "light", size = 38 }) {
+  const isDark = tone === "dark"
+  const highlightSize = Math.max(10, Math.round(size * 0.32))
+  const highlightInset = Math.max(5, Math.round(size * 0.16))
+  const radius = Math.round(size * 0.37)
+  const fontSize = Math.round(size * 0.42)
+  return (
+    <View style={[styles.headerLogo, { width: size, height: size, borderRadius: radius }, isDark ? styles.headerLogoDark : null]}>
+      <View
+        pointerEvents="none"
+        style={[styles.headerLogoHighlight, { top: highlightInset, left: highlightInset, width: highlightSize, height: highlightSize }]}
+      />
+      <Text style={[styles.headerLogoText, { fontSize }]} accessibilityLabel="Planner">
+        P
+      </Text>
+    </View>
+  )
+}
+
 function Header({
   title,
   subtitle,
@@ -229,6 +248,7 @@ function Header({
   onRefresh,
   onSignOut,
   tone = "light",
+  showLogo = true,
   titleStyle,
   buttonsStyle
 }) {
@@ -236,10 +256,7 @@ function Header({
   return (
     <View style={styles.header}>
       <View style={styles.headerLeft}>
-        <View style={[styles.headerLogo, isDark ? styles.headerLogoDark : null]}>
-          <View pointerEvents="none" style={styles.headerLogoHighlight} />
-          <Text style={styles.headerLogoText}>P</Text>
-        </View>
+        {showLogo ? <LogoMark tone={tone} size={38} /> : null}
         <View>
           <Text style={[styles.title, isDark ? styles.titleDark : null, titleStyle]}>{title}</Text>
           <Text style={[styles.subtitle, isDark ? styles.subtitleDark : null]}>
@@ -263,7 +280,7 @@ function Header({
                 loading ? styles.ghostButtonTextDisabled : null
               ]}
             >
-              ⟳
+              {"\u27f3"}
             </Text>
           </TouchableOpacity>
         ) : null}
@@ -274,7 +291,7 @@ function Header({
             accessibilityRole="button"
             accessibilityLabel="Settings"
           >
-            <Text style={[styles.ghostButtonText, isDark ? styles.ghostButtonTextDark : null]}>⚙</Text>
+            <Text style={[styles.ghostButtonText, isDark ? styles.ghostButtonTextDark : null]}>{"\u2699"}</Text>
           </TouchableOpacity>
         ) : null}
       </View>
@@ -764,6 +781,7 @@ function ListScreen({
         onRefresh={onRefresh}
         onSignOut={onSignOut}
         tone={tone}
+        showLogo={false}
         titleStyle={styles.calendarTitleOffset}
         buttonsStyle={styles.calendarButtonsOffset}
       />
@@ -1052,6 +1070,7 @@ function MemoScreen({
         onRefresh={onRefresh}
         onSignOut={onSignOut}
         tone={tone}
+        showLogo={false}
         titleStyle={styles.calendarTitleOffset}
         buttonsStyle={styles.calendarButtonsOffset}
       />
@@ -1537,6 +1556,7 @@ function CalendarScreen({
         onRefresh={onRefresh}
         onSignOut={onSignOut}
         tone={tone}
+        showLogo={false}
         titleStyle={styles.calendarTitleOffset}
         buttonsStyle={styles.calendarButtonsOffset}
       />
@@ -2394,9 +2414,7 @@ function AppInner() {
             showsVerticalScrollIndicator={false}
           >
             <View style={styles.authHero}>
-              <View style={styles.authLogo}>
-                <Text style={styles.authLogoText}>P</Text>
-              </View>
+              <LogoMark tone="light" size={56} />
               <Text style={styles.authHeadline}>Planner Mobile</Text>
               <Text style={styles.authTagline}>로그인해서 내 일정을 동기화하세요.</Text>
             </View>
@@ -2915,10 +2933,6 @@ const styles = StyleSheet.create({
   },
   headerLogoHighlight: {
     position: "absolute",
-    top: 6,
-    left: 6,
-    width: 12,
-    height: 12,
     borderRadius: 999,
     backgroundColor: "rgba(255, 255, 255, 0.18)"
   },
@@ -3656,7 +3670,7 @@ const styles = StyleSheet.create({
   },
   calendarTitleOffset: {
     marginTop: 28,
-    marginLeft: 10,
+    marginLeft: 0,
     paddingTop: 2
   },
   calendarNavButton: {
