@@ -245,7 +245,6 @@ function Header({
   title,
   subtitle,
   loading,
-  onRefresh,
   onSignOut,
   tone = "light",
   showLogo = true,
@@ -274,25 +273,6 @@ function Header({
         </View>
       </View>
       <View style={[styles.headerButtons, buttonsStyle]}>
-        {onRefresh ? (
-          <TouchableOpacity
-            style={[styles.ghostButton, isDark ? styles.ghostButtonDark : null]}
-            onPress={onRefresh}
-            disabled={loading}
-            accessibilityRole="button"
-            accessibilityLabel={loading ? "Refreshing" : "Refresh"}
-          >
-            <Text
-              style={[
-                styles.ghostButtonText,
-                isDark ? styles.ghostButtonTextDark : null,
-                loading ? styles.ghostButtonTextDisabled : null
-              ]}
-            >
-              {"\u27f3"}
-            </Text>
-          </TouchableOpacity>
-        ) : null}
         {onSignOut ? (
           <TouchableOpacity
             style={[styles.ghostButton, isDark ? styles.ghostButtonDark : null]}
@@ -308,7 +288,7 @@ function Header({
   )
 }
 
-function SettingsSheet({ visible, themeMode, fontScale, onChangeTheme, onChangeFontScale, onLogout, onClose }) {
+function SettingsSheet({ visible, themeMode, fontScale, onChangeTheme, onChangeFontScale, onRefresh, onLogout, onClose }) {
   return (
     <Modal transparent animationType="fade" visible={visible} statusBarTranslucent>
       <View style={styles.sheetOverlay}>
@@ -370,6 +350,21 @@ function SettingsSheet({ visible, themeMode, fontScale, onChangeTheme, onChangeF
                 })}
               </View>
             </View>
+
+            {onRefresh ? (
+              <View style={styles.settingsRow}>
+                <Text style={styles.settingsLabel}>새로고침</Text>
+                <Pressable
+                  style={styles.settingsActionBtn}
+                  onPress={() => {
+                    onRefresh?.()
+                    onClose?.()
+                  }}
+                >
+                  <Text style={styles.settingsActionText}>실행</Text>
+                </Pressable>
+              </View>
+            ) : null}
 
             <Pressable style={styles.settingsLogoutBtn} onPress={onLogout}>
               <Text style={styles.settingsLogoutText}>로그아웃</Text>
@@ -2543,6 +2538,11 @@ function AppInner() {
           setFontScale(clamped)
           persistFontScale(clamped)
         }}
+        onRefresh={() => {
+          loadPlans(session?.user?.id)
+          loadWindows(session?.user?.id)
+          loadRightMemos(session?.user?.id, memoYear)
+        }}
         onLogout={() => {
           setSettingsVisible(false)
           handleSignOut()
@@ -4274,6 +4274,21 @@ const styles = StyleSheet.create({
     color: "#64748b"
   },
   settingsSegTextActive: {
+    color: ACCENT_BLUE
+  },
+  settingsActionBtn: {
+    height: 34,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: "#eef2ff",
+    borderWidth: 1,
+    borderColor: "#dbeafe",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  settingsActionText: {
+    fontSize: 12,
+    fontWeight: "900",
     color: ACCENT_BLUE
   },
   settingsLogoutBtn: {
