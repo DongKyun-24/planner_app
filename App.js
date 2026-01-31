@@ -95,14 +95,14 @@ function weekdayLabel(dateKey) {
   return weekdays[dt.getDay()] ?? ""
 }
 
-function weekdayColor(dateKey, { isHoliday } = {}) {
+function weekdayColor(dateKey, { isHoliday, isDark } = {}) {
   if (isHoliday) return ACCENT_RED
   const dt = parseDateKey(dateKey)
-  if (!dt) return "#0f172a"
+  if (!dt) return isDark ? "#e5e7eb" : "#0f172a"
   const dow = dt.getDay()
   if (dow === 0) return ACCENT_RED
   if (dow === 6) return ACCENT_BLUE
-  return "#0f172a"
+  return isDark ? "#e5e7eb" : "#0f172a"
 }
 
 function formatDateMD(dateKey) {
@@ -673,6 +673,7 @@ function ListScreen({
     return Math.max(0.85, Math.min(1.25, n))
   }, [fontScale])
   const fs = useCallback((n) => Math.round(n * scale), [scale])
+  const isDark = tone === "dark"
   const today = new Date()
   const [viewYear, setViewYear] = useState(today.getFullYear())
   const [viewMonth, setViewMonth] = useState(today.getMonth() + 1)
@@ -755,7 +756,7 @@ function ListScreen({
   }, [visibleSections, todayKey, scrollToken])
 
   return (
-    <SafeAreaView style={[styles.container, styles.calendarFill]}>
+    <SafeAreaView style={[styles.container, styles.calendarFill, isDark ? styles.containerDark : null]}>
       <Header
         title="Planner"
         loading={loading}
@@ -778,16 +779,16 @@ function ListScreen({
       <View style={styles.listMonthBar}>
         <View style={styles.listMonthLeftGroup}>
           <TouchableOpacity style={styles.listMonthNavButton} onPress={goPrevMonth}>
-            <Text style={styles.listMonthNavText}>{"‹"}</Text>
+            <Text style={[styles.listMonthNavText, isDark ? styles.textDark : null]}>{"‹"}</Text>
           </TouchableOpacity>
-          <Text style={styles.listMonthText}>{monthLabel}</Text>
+          <Text style={[styles.listMonthText, isDark ? styles.textDark : null]}>{monthLabel}</Text>
           <TouchableOpacity style={styles.listMonthNavButton} onPress={goNextMonth}>
-            <Text style={styles.listMonthNavText}>{"›"}</Text>
+            <Text style={[styles.listMonthNavText, isDark ? styles.textDark : null]}>{"›"}</Text>
           </TouchableOpacity>
         </View>
         <View style={styles.listMonthRightGroup}>
           <TouchableOpacity
-            style={styles.listAddButton}
+            style={[styles.listAddButton, isDark ? styles.listPillDark : null]}
             onPress={() => {
               const key =
                 viewYear === today.getFullYear() && viewMonth === today.getMonth() + 1
@@ -796,42 +797,48 @@ function ListScreen({
               onAddPlan?.(key)
             }}
           >
-            <Text style={styles.listAddText}>+ Add</Text>
+            <Text style={[styles.listAddText, isDark ? styles.textDark : null]}>+ Add</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.listTodayButton} onPress={goToday}>
-            <Text style={styles.listTodayText}>Today</Text>
+          <TouchableOpacity style={[styles.listTodayButton, isDark ? styles.listPillDark : null]} onPress={goToday}>
+            <Text style={[styles.listTodayText, isDark ? styles.textDark : null]}>Today</Text>
           </TouchableOpacity>
         </View>
       </View>
-      <View style={[styles.card, styles.listCard]}>
+      <View style={[styles.card, styles.listCard, isDark ? styles.cardDark : null]}>
         {loading ? <ActivityIndicator size="small" color="#3b82f6" /> : null}
         <SectionList
           ref={listRef}
           sections={visibleSections}
           keyExtractor={(item) => item.id ?? `${item.date}-${item.content}`}
           stickySectionHeadersEnabled={false}
-          renderItem={({ item }) => {
-            const time = item?.time ? String(item.time).trim() : ""
-            const content = String(item?.content ?? "").trim()
-            const category = String(item?.category_id ?? "").trim()
-            const isGeneral = !category || category === "__general__"
-            const categoryColor = colorByTitle.get(category) || "#94a3b8"
-            return (
-              <Pressable style={styles.itemRow} onPress={() => onEditPlan?.(item)}>
-                <View style={styles.itemLeftCol}>
-                  <Text style={time ? [styles.itemTimeText, { fontSize: fs(12) }] : [styles.itemTimeTextEmpty, { fontSize: fs(12) }]}>
-                    {time || " "}
-                  </Text>
-                </View>
-                <View style={styles.itemMainCol}>
-                  <View style={styles.itemTopRow}>
-                    <Text style={[styles.itemTitle, { fontSize: fs(14) }]} numberOfLines={1}>
+	          renderItem={({ item }) => {
+	            const time = item?.time ? String(item.time).trim() : ""
+	            const content = String(item?.content ?? "").trim()
+	            const category = String(item?.category_id ?? "").trim()
+	            const isGeneral = !category || category === "__general__"
+	            const categoryColor = colorByTitle.get(category) || "#94a3b8"
+	            return (
+	              <Pressable style={[styles.itemRow, isDark ? styles.itemRowDark : null]} onPress={() => onEditPlan?.(item)}>
+	                <View style={styles.itemLeftCol}>
+	                  <Text
+	                    style={
+	                      time
+	                        ? [styles.itemTimeText, { fontSize: fs(12) }, isDark ? styles.itemTimeTextDark : null]
+	                        : [styles.itemTimeTextEmpty, { fontSize: fs(12) }]
+	                    }
+	                  >
+	                    {time || " "}
+	                  </Text>
+	                </View>
+	                <View style={styles.itemMainCol}>
+	                  <View style={styles.itemTopRow}>
+	                    <Text style={[styles.itemTitle, { fontSize: fs(14) }, isDark ? styles.textDark : null]} numberOfLines={1}>
                       {content}
                     </Text>
                     {!isGeneral ? (
-                      <View style={styles.itemCategoryBadge}>
+                      <View style={[styles.itemCategoryBadge, isDark ? styles.badgeDark : null]}>
                         <View style={[styles.itemCategoryDot, { backgroundColor: categoryColor }]} />
-                        <Text style={styles.itemCategoryText} numberOfLines={1}>
+                        <Text style={[styles.itemCategoryText, isDark ? styles.textMutedDark : null]} numberOfLines={1}>
                           {category}
                         </Text>
                       </View>
@@ -841,15 +848,19 @@ function ListScreen({
               </Pressable>
             )
           }}
-          renderSectionHeader={({ section }) => {
-            const key = String(section.title ?? "")
-            const holidayName = holidaysByDate?.get?.(key) ?? ""
-            const isHoliday = Boolean(holidayName)
-            const color = weekdayColor(key, { isHoliday })
-            const dow = weekdayLabel(key)
-            return (
-              <Pressable
-                style={[styles.sectionHeader, section.title === todayKey ? styles.sectionHeaderToday : null]}
+	          renderSectionHeader={({ section }) => {
+	            const key = String(section.title ?? "")
+	            const holidayName = holidaysByDate?.get?.(key) ?? ""
+	            const isHoliday = Boolean(holidayName)
+	            const color = weekdayColor(key, { isHoliday, isDark })
+	            const dow = weekdayLabel(key)
+	            return (
+	              <Pressable
+	                style={[
+                  styles.sectionHeader,
+                  isDark ? styles.sectionHeaderDark : null,
+                  section.title === todayKey ? (isDark ? styles.sectionHeaderTodayDark : styles.sectionHeaderToday) : null
+                ]}
                 onPress={() => onAddPlan?.(key)}
               >
                 <View style={styles.sectionHeaderRow}>
@@ -879,7 +890,7 @@ function ListScreen({
                   </View>
                   <View style={styles.sectionHeaderRight}>
                     {holidayName ? (
-                      <View style={styles.sectionHeaderHolidayBadge}>
+                      <View style={[styles.sectionHeaderHolidayBadge, isDark ? styles.holidayBadgeDark : null]}>
                         <Text numberOfLines={1} style={[styles.sectionHeaderHolidayBadgeText, { fontSize: fs(11) }]}>
                           {holidayName}
                         </Text>
@@ -926,6 +937,7 @@ function MemoScreen({
   onSaveMemo
 }) {
   const insets = useSafeAreaInsets()
+  const isDark = tone === "dark"
   const scale = useMemo(() => {
     const n = Number(fontScale)
     if (!Number.isFinite(n)) return 1
@@ -1032,7 +1044,7 @@ function MemoScreen({
   }
 
   return (
-    <SafeAreaView style={[styles.container, styles.calendarFill]}>
+    <SafeAreaView style={[styles.container, styles.calendarFill, isDark ? styles.containerDark : null]}>
       <Header
         title="Planner"
         loading={loading}
@@ -1052,13 +1064,15 @@ function MemoScreen({
         onChangeWindowColor={onChangeWindowColor}
         tone={tone}
       />
-      <View style={[styles.card, styles.memoCard]}>
+      <View style={[styles.card, styles.memoCard, isDark ? styles.cardDark : null]}>
         {loading ? <ActivityIndicator size="small" color="#3b82f6" /> : null}
         <View style={styles.memoEditorWrap}>
           <View style={styles.memoEditorBar}>
-            <Text style={styles.memoEditorTitle}>{activeTabId === "all" ? "통합 메모" : "메모"}</Text>
+            <Text style={[styles.memoEditorTitle, isDark ? styles.textDark : null]}>
+              {activeTabId === "all" ? "통합 메모" : "메모"}
+            </Text>
             <Pressable
-              style={styles.memoEditBtn}
+              style={[styles.memoEditBtn, isDark ? styles.listPillDark : null]}
               onPress={() => {
                 const next = !isEditing
                 setIsEditing(next)
@@ -1066,13 +1080,13 @@ function MemoScreen({
                 else Keyboard.dismiss()
               }}
             >
-              <Text style={styles.memoEditBtnText}>{isEditing ? "완료" : "편집"}</Text>
+              <Text style={[styles.memoEditBtnText, isDark ? styles.textDark : null]}>{isEditing ? "완료" : "편집"}</Text>
             </Pressable>
           </View>
 
           {!isEditing ? (
             <ScrollView
-              style={styles.memoPaper}
+              style={[styles.memoPaper, isDark ? styles.paperDark : null]}
               contentContainerStyle={styles.memoPaperContent}
               keyboardShouldPersistTaps="handled"
               showsVerticalScrollIndicator
@@ -1080,14 +1094,18 @@ function MemoScreen({
               {String(draft ?? "").trim() ? (
                 <Text
                   selectable
-                  style={[styles.memoText, { fontSize: Math.round(14 * scale), lineHeight: Math.round(20 * scale) }]}
+                  style={[
+                    styles.memoText,
+                    { fontSize: Math.round(14 * scale), lineHeight: Math.round(20 * scale) },
+                    isDark ? styles.textDark : null
+                  ]}
                 >
                   {draft}
                 </Text>
               ) : (
                 <View style={styles.memoEmpty}>
-                  <Text style={styles.memoEmptyTitle}>메모</Text>
-                  <Text style={styles.memoEmptySub}>오른쪽 상단 ‘편집’으로 작성하세요.</Text>
+                  <Text style={[styles.memoEmptyTitle, isDark ? styles.textDark : null]}>메모</Text>
+                  <Text style={[styles.memoEmptySub, isDark ? styles.textMutedDark : null]}>오른쪽 상단 ‘편집’으로 작성하세요.</Text>
                 </View>
               )}
             </ScrollView>
@@ -1120,7 +1138,8 @@ function MemoScreen({
                     fontSize: Math.round(14 * scale),
                     lineHeight: Math.round(20 * scale),
                     paddingBottom: Math.max(16, insets.bottom + 12)
-                  }
+                  },
+                  isDark ? styles.inputDark : null
                 ]}
               />
             </KeyboardAvoidingView>
@@ -1432,6 +1451,7 @@ function CalendarScreen({
   onEditPlan,
   onSelectDateKey
 }) {
+  const isDark = tone === "dark"
   const today = new Date()
   const [viewYear, setViewYear] = useState(today.getFullYear())
   const [viewMonth, setViewMonth] = useState(today.getMonth() + 1)
@@ -1509,7 +1529,7 @@ function CalendarScreen({
   }
 
   return (
-    <SafeAreaView style={[styles.container, styles.calendarFill]}>
+    <SafeAreaView style={[styles.container, styles.calendarFill, isDark ? styles.containerDark : null]}>
       <Header
         title="Planner"
         loading={loading}
@@ -1529,34 +1549,37 @@ function CalendarScreen({
         onChangeWindowColor={onChangeWindowColor}
         tone={tone}
       />
-      <View style={[styles.card, styles.calendarCard]}>
-          <View style={styles.calendarHeaderWrap}>
-            <View style={styles.calendarHeader}>
-              <TouchableOpacity style={[styles.calendarNavButton, styles.calendarHeaderLeft]} onPress={goPrevMonth}>
-                <Text style={styles.calendarNavText}>{"<"}</Text>
-              </TouchableOpacity>
-              <Text style={styles.calendarTitleCentered}>{monthLabel}</Text>
-              <View style={styles.calendarHeaderRight}>
-                <TouchableOpacity style={styles.listTodayButton} onPress={goToday}>
-                  <Text style={styles.listTodayText}>Today</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.calendarNavButton} onPress={goNextMonth}>
-                  <Text style={styles.calendarNavText}>{">"}</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-            <View style={styles.weekHeaderRow}>
-              {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d, idx) => (
-                <Text key={d + idx} style={styles.weekHeaderText}>
-                  {d}
-                </Text>
-              ))}
-            </View>
-          </View>
-          <View style={styles.calendarGrid} onLayout={(e) => setGridHeight(e.nativeEvent.layout.height)}>
-            {cells.map((day, idx) => {
-              const key = day ? dateToKey(viewYear, viewMonth, day) : null
-              const items = key ? itemsByDate.get(key) ?? [] : []
+	      <View style={[styles.card, styles.calendarCard, isDark ? styles.cardDark : null]}>
+	          <View style={[styles.calendarHeaderWrap, isDark ? styles.calendarHeaderWrapDark : null]}>
+	            <View style={styles.calendarHeader}>
+	              <TouchableOpacity
+	                style={[styles.calendarNavButton, isDark ? styles.calendarNavButtonDark : null, styles.calendarHeaderLeft]}
+	                onPress={goPrevMonth}
+	              >
+	                <Text style={[styles.calendarNavText, isDark ? styles.calendarNavTextDark : null]}>{"<"}</Text>
+	              </TouchableOpacity>
+	              <Text style={[styles.calendarTitleCentered, isDark ? styles.textDark : null]}>{monthLabel}</Text>
+	              <View style={styles.calendarHeaderRight}>
+	                <TouchableOpacity style={[styles.listTodayButton, isDark ? styles.listPillDark : null]} onPress={goToday}>
+	                  <Text style={[styles.listTodayText, isDark ? styles.textDark : null]}>Today</Text>
+	                </TouchableOpacity>
+	                <TouchableOpacity style={[styles.calendarNavButton, isDark ? styles.calendarNavButtonDark : null]} onPress={goNextMonth}>
+	                  <Text style={[styles.calendarNavText, isDark ? styles.calendarNavTextDark : null]}>{">"}</Text>
+	                </TouchableOpacity>
+	              </View>
+	            </View>
+	            <View style={[styles.weekHeaderRow, isDark ? styles.weekHeaderRowDark : null]}>
+	              {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d, idx) => (
+	                <Text key={d + idx} style={[styles.weekHeaderText, isDark ? styles.textMutedDark : null]}>
+	                  {d}
+	                </Text>
+	              ))}
+	            </View>
+	          </View>
+	          <View style={[styles.calendarGrid, isDark ? styles.calendarGridDark : null]} onLayout={(e) => setGridHeight(e.nativeEvent.layout.height)}>
+	            {cells.map((day, idx) => {
+	              const key = day ? dateToKey(viewYear, viewMonth, day) : null
+	              const items = key ? itemsByDate.get(key) ?? [] : []
               const count = items.length
               const holidayName = key ? holidaysByDate?.get?.(key) ?? "" : ""
               const holidayLabel = holidayName ? String(holidayName).trim() : ""
@@ -1568,54 +1591,56 @@ function CalendarScreen({
               const row = Math.floor(idx / 7)
               const isSunday = col === 0
               const isSaturday = col === 6
-              const isLastCol = col === 6
-              const isLastRow = row === weeks - 1
-              const isToday = key === todayKey
-              const isSelected = key && key === selectedDateKey
-            return (
-              <Pressable
-                key={`${idx}-${day ?? "x"}`}
-                style={[
-                  styles.calendarCell,
-                  cellHeight ? { height: cellHeight } : null,
-                  isLastCol ? styles.calendarCellLastCol : null,
-                  isLastRow ? styles.calendarCellLastRow : null,
-                  isToday ? styles.calendarCellToday : null,
-                  isSelected ? styles.calendarCellSelected : null
-                ]}
-                onPress={() => openDate(day)}
-              >
-                <View style={styles.calendarCellHeader}>
-                  <Text
-                    style={[
-                      styles.calendarDay,
-                      day ? null : styles.calendarDayMuted,
-                      isSunday ? styles.calendarDaySunday : null,
-                      isSaturday ? styles.calendarDaySaturday : null,
-                      isToday ? styles.calendarDayToday : null,
-                      isSelected ? styles.calendarDaySelected : null,
-                      isHoliday ? styles.calendarDayHoliday : null
-                    ]}
-                  >
-                    {day ?? ""}
-                  </Text>
-                  {hiddenCount > 0 ? (
-                    <View style={styles.calendarMoreBadge}>
-                      <Text style={styles.calendarMoreText}>+{hiddenCount}</Text>
-                    </View>
-                  ) : null}
-                </View>
-                {holidayLabel ? (
-                  <Text
-                    numberOfLines={1}
-                    adjustsFontSizeToFit
-                    minimumFontScale={0.6}
-                    style={styles.calendarHolidayText}
-                  >
-                    {holidayLabel}
-                  </Text>
-                ) : null}
-                <View style={styles.calendarLineStack}>
+	              const isLastCol = col === 6
+	              const isLastRow = row === weeks - 1
+	              const isToday = key === todayKey
+	              const isSelected = key && key === selectedDateKey
+	            return (
+	              <Pressable
+	                key={`${idx}-${day ?? "x"}`}
+	                style={[
+	                  styles.calendarCell,
+	                  isDark ? styles.calendarCellDark : null,
+	                  cellHeight ? { height: cellHeight } : null,
+	                  isLastCol ? styles.calendarCellLastCol : null,
+	                  isLastRow ? styles.calendarCellLastRow : null,
+	                  isToday ? (isDark ? styles.calendarCellTodayDark : styles.calendarCellToday) : null,
+	                  isSelected ? (isDark ? styles.calendarCellSelectedDark : styles.calendarCellSelected) : null
+	                ]}
+	                onPress={() => openDate(day)}
+	              >
+	                <View style={styles.calendarCellHeader}>
+	                  <Text
+	                    style={[
+	                      styles.calendarDay,
+	                      isDark ? styles.calendarDayDark : null,
+	                      day ? null : styles.calendarDayMuted,
+	                      isSunday ? styles.calendarDaySunday : null,
+	                      isSaturday ? styles.calendarDaySaturday : null,
+	                      isToday ? (isDark ? styles.calendarDayTodayDark : styles.calendarDayToday) : null,
+	                      isSelected ? (isDark ? styles.calendarDaySelectedDark : styles.calendarDaySelected) : null,
+	                      isHoliday ? styles.calendarDayHoliday : null
+	                    ]}
+	                  >
+	                    {day ?? ""}
+	                  </Text>
+	                  {hiddenCount > 0 ? (
+	                    <View style={[styles.calendarMoreBadge, isDark ? styles.calendarMoreBadgeDark : null]}>
+	                      <Text style={[styles.calendarMoreText, isDark ? styles.calendarMoreTextDark : null]}>+{hiddenCount}</Text>
+	                    </View>
+	                  ) : null}
+	                </View>
+	                {holidayLabel ? (
+	                  <Text
+	                    numberOfLines={1}
+	                    adjustsFontSizeToFit
+	                    minimumFontScale={0.6}
+	                    style={[styles.calendarHolidayText, isDark ? styles.calendarHolidayTextDark : null]}
+	                  >
+	                    {holidayLabel}
+	                  </Text>
+	                ) : null}
+	                <View style={styles.calendarLineStack}>
                   {visible.map((item) => {
                     const line = formatLine(item)
                     const category = String(item?.category_id ?? "").trim()
@@ -1623,21 +1648,21 @@ function CalendarScreen({
                       category && category !== "__general__"
                         ? colorByTitle.get(category) || "#94a3b8"
                         : "#9aa3b2"
-                    return (
-                      <View key={item.id ?? `${item.date}-${item.content}`} style={styles.calendarLine}>
-                        <View style={[styles.calendarDot, { backgroundColor: dotColor }]} />
-                        <Text numberOfLines={1} style={styles.calendarLineText}>
-                          {line.text}
-                        </Text>
-                      </View>
-                    )
-                  })}
-                </View>
-              </Pressable>
-            )
-          })}
-        </View>
-      </View>
+	                    return (
+	                      <View key={item.id ?? `${item.date}-${item.content}`} style={styles.calendarLine}>
+	                        <View style={[styles.calendarDot, { backgroundColor: dotColor }]} />
+	                        <Text numberOfLines={1} style={[styles.calendarLineText, isDark ? styles.calendarLineTextDark : null]}>
+	                          {line.text}
+	                        </Text>
+	                      </View>
+	                    )
+	                  })}
+	                </View>
+	              </Pressable>
+	            )
+	          })}
+	        </View>
+	      </View>
     
       <Modal
         visible={Boolean(selectedDateKey)}
@@ -1649,11 +1674,11 @@ function CalendarScreen({
       >
         <View style={styles.dayModalOverlay}>
           <Pressable style={styles.dayModalBackdrop} onPress={() => setSelectedDateKey(null)} />
-          <View style={styles.dayModalCard}>
+          <View style={[styles.dayModalCard, isDark ? styles.dayModalCardDark : null]}>
             <View style={styles.dayModalHeader}>
               <View style={styles.dayModalHeaderLeft}>
-                <Text style={styles.dayModalTitle}>{selectedDateLabel || selectedDateKey}</Text>
-                <View style={styles.dayModalCountPill}>
+                <Text style={[styles.dayModalTitle, isDark ? styles.textDark : null]}>{selectedDateLabel || selectedDateKey}</Text>
+                <View style={[styles.dayModalCountPill, isDark ? styles.dayModalCountPillDark : null]}>
                   <Text style={styles.dayModalCountText}>{dayItems.length}개</Text>
                 </View>
               </View>
@@ -1663,20 +1688,20 @@ function CalendarScreen({
                     if (!selectedDateKey) return
                     onAddPlan?.(selectedDateKey)
                   }}
-                  style={styles.dayModalAddBtn}
+                  style={[styles.dayModalAddBtn, isDark ? styles.dayModalAddBtnDark : null]}
                 >
                   <Text style={styles.dayModalAddText}>+ 추가</Text>
                 </Pressable>
-                <Pressable onPress={() => setSelectedDateKey(null)} style={styles.dayModalCloseBtn}>
-                  <Text style={styles.dayModalCloseX}>닫기</Text>
+                <Pressable onPress={() => setSelectedDateKey(null)} style={[styles.dayModalCloseBtn, isDark ? styles.dayModalCloseBtnDark : null]}>
+                  <Text style={[styles.dayModalCloseX, isDark ? styles.textDark : null]}>닫기</Text>
                 </Pressable>
               </View>
             </View>
             <ScrollView contentContainerStyle={styles.dayModalList}>
               {dayItems.length === 0 ? (
                 <View style={styles.dayModalEmpty}>
-                  <Text style={styles.dayModalEmptyTitle}>할 일이 없어요</Text>
-                  <Text style={styles.dayModalEmptySub}>이 날짜에 등록된 일정이 없습니다.</Text>
+                  <Text style={[styles.dayModalEmptyTitle, isDark ? styles.textDark : null]}>할 일이 없어요</Text>
+                  <Text style={[styles.dayModalEmptySub, isDark ? styles.textMutedDark : null]}>이 날짜에 등록된 일정이 없습니다.</Text>
                 </View>
               ) : (
                 dayItems.map((item) => {
@@ -1685,15 +1710,15 @@ function CalendarScreen({
                   return (
                     <Pressable
                       key={item.id ?? `${item.date}-${item.content}`}
-                      style={styles.dayModalItemRow}
+                      style={[styles.dayModalItemRow, isDark ? styles.dayModalItemRowDark : null]}
                       onPress={() => onEditPlan?.(item)}
                     >
                       {time ? (
-                        <Text style={styles.dayModalItemTime}>{time}</Text>
+                        <Text style={[styles.dayModalItemTime, isDark ? styles.textMutedDark : null]}>{time}</Text>
                       ) : (
                         <Text style={styles.dayModalItemTimeEmpty}>{"\u00A0"}</Text>
                       )}
-                      <Text style={styles.dayModalItemText}>{line.text}</Text>
+                      <Text style={[styles.dayModalItemText, isDark ? styles.textDark : null]}>{line.text}</Text>
                     </Pressable>
                   )
                 })
@@ -1708,16 +1733,22 @@ function CalendarScreen({
 
 function AppInner() {
   const insets = useSafeAreaInsets()
-  const tabBarStyle = useMemo(
-    () => [
+  const [settingsVisible, setSettingsVisible] = useState(false)
+  const [themeMode, setThemeMode] = useState("light") // "light" | "dark"
+  const [fontScale, setFontScale] = useState(1)
+
+  const tabBarStyle = useMemo(() => {
+    const isDark = themeMode === "dark"
+    return [
       styles.tabBar,
+      isDark ? styles.tabBarDark : null,
       {
         height: 50 + insets.bottom,
         paddingBottom: Math.max(insets.bottom, 6)
       }
-    ],
-    [insets.bottom]
-  )
+    ]
+  }, [insets.bottom, themeMode])
+
   const fabBottom = useMemo(() => 50 + insets.bottom + 18, [insets.bottom])
 
   const [session, setSession] = useState(null)
@@ -1742,9 +1773,6 @@ function AppInner() {
   const [planEditorVisible, setPlanEditorVisible] = useState(false)
   const [planDraft, setPlanDraft] = useState(null)
   const [activeScreen, setActiveScreen] = useState("List")
-  const [settingsVisible, setSettingsVisible] = useState(false)
-  const [themeMode, setThemeMode] = useState("light") // "light" | "dark"
-  const [fontScale, setFontScale] = useState(1)
   const lastCalendarDateKeyRef = useRef(null)
 
   const memoYear = new Date().getFullYear()
@@ -2643,6 +2671,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 9,
     paddingBottom: 0
   },
+  containerDark: {
+    backgroundColor: "#0b1220"
+  },
   tabBar: {
     paddingTop: 2,
     borderTopWidth: 1,
@@ -2653,6 +2684,16 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     shadowOffset: { width: 0, height: -3 },
     elevation: 10
+  },
+  tabBarDark: {
+    backgroundColor: "#0b1220",
+    shadowOpacity: 0
+  },
+  textDark: {
+    color: "#f8fafc"
+  },
+  textMutedDark: {
+    color: "#cbd5e1"
   },
   tabItem: {
     paddingVertical: 2
@@ -3086,6 +3127,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
+  listPillDark: {
+    backgroundColor: "#111827",
+    borderColor: "rgba(148, 163, 184, 0.20)"
+  },
   listAddText: {
     fontSize: 12,
     fontWeight: "800",
@@ -3150,6 +3195,13 @@ const styles = StyleSheet.create({
     shadowRadius: 12,
     shadowOffset: { width: 0, height: 4 },
     elevation: 2
+  },
+  cardDark: {
+    backgroundColor: "#0f172a",
+    borderWidth: 1,
+    borderColor: "rgba(148, 163, 184, 0.18)",
+    shadowOpacity: 0,
+    elevation: 0
   },
   listCard: {
     padding: 0,
@@ -3228,8 +3280,16 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: "#eef2f7"
   },
+  sectionHeaderDark: {
+    backgroundColor: "#0b1220",
+    borderTopColor: "rgba(148, 163, 184, 0.14)",
+    borderBottomColor: "rgba(148, 163, 184, 0.14)"
+  },
   sectionHeaderToday: {
     backgroundColor: "#eef2ff"
+  },
+  sectionHeaderTodayDark: {
+    backgroundColor: "#111827"
   },
   sectionHeaderDateText: {
     fontSize: 14,
@@ -3294,6 +3354,9 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
+  holidayBadgeDark: {
+    backgroundColor: "rgba(248, 113, 113, 0.16)"
+  },
   sectionHeaderHolidayBadgeText: {
     fontSize: 11,
     fontWeight: "900",
@@ -3313,6 +3376,9 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: "#eef2f7"
   },
+  itemRowDark: {
+    borderBottomColor: "rgba(148, 163, 184, 0.14)"
+  },
   itemLeftCol: {
     width: 54,
     paddingTop: 1,
@@ -3324,6 +3390,9 @@ const styles = StyleSheet.create({
     fontWeight: "900",
     color: "#334155",
     textAlign: "right"
+  },
+  itemTimeTextDark: {
+    color: "#9ca3af"
   },
   itemTimeTextEmpty: {
     fontSize: 12,
@@ -3359,6 +3428,10 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 6
+  },
+  badgeDark: {
+    backgroundColor: "#111827",
+    borderColor: "rgba(148, 163, 184, 0.18)"
   },
   itemCategoryDot: {
     width: 8,
@@ -3460,6 +3533,11 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: "#0f172a"
   },
+  inputDark: {
+    backgroundColor: "#0b1220",
+    borderColor: "rgba(148, 163, 184, 0.18)",
+    color: "#f8fafc"
+  },
   memoPaper: {
     backgroundColor: "#ffffff",
     borderRadius: 16,
@@ -3467,6 +3545,10 @@ const styles = StyleSheet.create({
     borderColor: "#eef2f7",
     padding: 14,
     minHeight: 240
+  },
+  paperDark: {
+    backgroundColor: "#0b1220",
+    borderColor: "rgba(148, 163, 184, 0.18)"
   },
   memoPaperContent: {
     flexGrow: 1
@@ -3540,6 +3622,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 0,
     backgroundColor: "#ffffff"
   },
+  calendarHeaderWrapDark: {
+    backgroundColor: "#0f172a"
+  },
   calendarFill: {
     paddingTop: 2,
     paddingHorizontal: 2,
@@ -3563,10 +3648,17 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
+  calendarNavButtonDark: {
+    backgroundColor: "#111827",
+    borderColor: "rgba(148, 163, 184, 0.20)"
+  },
   calendarNavText: {
     fontSize: 18,
     fontWeight: "700",
     color: ACCENT_BLUE
+  },
+  calendarNavTextDark: {
+    color: "#e5e7eb"
   },
   calendarTitle: {
     fontSize: 16,
@@ -3581,6 +3673,9 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
     backgroundColor: "#f8fafc",
     borderRadius: 6
+  },
+  weekHeaderRowDark: {
+    backgroundColor: "#111827"
   },
   weekHeaderText: {
     width: "14.285%",
@@ -3597,6 +3692,9 @@ const styles = StyleSheet.create({
     borderColor: "#dbe3f0",
     borderTopWidth: 0
   },
+  calendarGridDark: {
+    borderColor: "rgba(148, 163, 184, 0.18)"
+  },
   calendarCell: {
     width: "14.285%",
     borderRightWidth: 1,
@@ -3606,11 +3704,20 @@ const styles = StyleSheet.create({
     alignItems: "flex-start",
     justifyContent: "flex-start"
   },
+  calendarCellDark: {
+    borderColor: "rgba(148, 163, 184, 0.14)"
+  },
   calendarCellToday: {
     backgroundColor: "#eef2ff"
   },
+  calendarCellTodayDark: {
+    backgroundColor: "rgba(59, 130, 246, 0.14)"
+  },
   calendarCellSelected: {
     backgroundColor: "#dbeafe"
+  },
+  calendarCellSelectedDark: {
+    backgroundColor: "rgba(59, 130, 246, 0.22)"
   },
   calendarCellLastCol: {
     borderRightWidth: 0
@@ -3629,11 +3736,20 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#0f172a"
   },
+  calendarDayDark: {
+    color: "#e5e7eb"
+  },
   calendarDayToday: {
     color: ACCENT_BLUE
   },
+  calendarDayTodayDark: {
+    color: "#93c5fd"
+  },
   calendarDaySelected: {
     color: "#1e40af"
+  },
+  calendarDaySelectedDark: {
+    color: "#bfdbfe"
   },
   calendarDayMuted: {
     color: "#cbd5f5"
@@ -3656,6 +3772,9 @@ const styles = StyleSheet.create({
     lineHeight: 10,
     textAlign: "left"
   },
+  calendarHolidayTextDark: {
+    color: "#fca5a5"
+  },
   calendarLineStack: {
     width: "100%",
     gap: 1,
@@ -3677,6 +3796,9 @@ const styles = StyleSheet.create({
     lineHeight: 10,
     color: "#1f2937"
   },
+  calendarLineTextDark: {
+    color: "#cbd5e1"
+  },
   calendarMoreBadge: {
     alignSelf: "flex-start",
     paddingHorizontal: 6,
@@ -3686,10 +3808,17 @@ const styles = StyleSheet.create({
     borderColor: "#c7d2fe",
     backgroundColor: "#eef2ff"
   },
+  calendarMoreBadgeDark: {
+    borderColor: "rgba(148, 163, 184, 0.22)",
+    backgroundColor: "rgba(148, 163, 184, 0.10)"
+  },
   calendarMoreText: {
     fontSize: 8,
     fontWeight: "700",
     color: ACCENT_BLUE
+  },
+  calendarMoreTextDark: {
+    color: "#e5e7eb"
   },
   dayModalOverlay: {
     flex: 1,
@@ -3721,6 +3850,13 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 8 },
     elevation: 6
   },
+  dayModalCardDark: {
+    backgroundColor: "#0f172a",
+    borderWidth: 1,
+    borderColor: "rgba(148, 163, 184, 0.18)",
+    shadowOpacity: 0,
+    elevation: 0
+  },
   dayModalHeader: {
     flexDirection: "row",
     alignItems: "center",
@@ -3745,6 +3881,9 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
+  dayModalAddBtnDark: {
+    backgroundColor: "#2563eb"
+  },
   dayModalAddText: {
     fontSize: 12,
     fontWeight: "900",
@@ -3765,6 +3904,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
+  dayModalCountPillDark: {
+    backgroundColor: "rgba(148, 163, 184, 0.12)",
+    borderColor: "rgba(148, 163, 184, 0.20)"
+  },
   dayModalCountText: {
     fontSize: 12,
     fontWeight: "800",
@@ -3777,6 +3920,9 @@ const styles = StyleSheet.create({
     backgroundColor: "#f1f5f9",
     alignItems: "center",
     justifyContent: "center"
+  },
+  dayModalCloseBtnDark: {
+    backgroundColor: "rgba(148, 163, 184, 0.16)"
   },
   dayModalCloseX: {
     fontSize: 12,
@@ -3809,6 +3955,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     borderBottomWidth: 1,
     borderBottomColor: "#eef2f7"
+  },
+  dayModalItemRowDark: {
+    borderBottomColor: "rgba(148, 163, 184, 0.14)"
   },
   dayModalItemTime: {
     width: 62,
