@@ -352,18 +352,15 @@ function SettingsSheet({ visible, themeMode, fontScale, onChangeTheme, onChangeF
             </View>
 
             {onRefresh ? (
-              <View style={styles.settingsRow}>
-                <Text style={styles.settingsLabel}>새로고침</Text>
-                <Pressable
-                  style={styles.settingsActionBtn}
-                  onPress={() => {
-                    onRefresh?.()
-                    onClose?.()
-                  }}
-                >
-                  <Text style={styles.settingsActionText}>실행</Text>
-                </Pressable>
-              </View>
+              <Pressable
+                style={styles.settingsRefreshBtn}
+                onPress={() => {
+                  onRefresh?.()
+                  onClose?.()
+                }}
+              >
+                <Text style={styles.settingsRefreshText}>새로고침</Text>
+              </Pressable>
             ) : null}
 
             <Pressable style={styles.settingsLogoutBtn} onPress={onLogout}>
@@ -3284,29 +3281,32 @@ const styles = StyleSheet.create({
     fontWeight: "700"
   },
   ghostButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 16,
-    backgroundColor: "#eef2ff",
+    width: 38,
+    height: 38,
+    borderRadius: 14,
+    backgroundColor: "rgba(43, 103, 199, 0.08)",
+    borderWidth: 1,
+    borderColor: "rgba(43, 103, 199, 0.18)",
     alignItems: "center",
     justifyContent: "center"
   },
   ghostButtonText: {
     color: ACCENT_BLUE,
     fontWeight: "900",
-    fontSize: 22,
+    fontSize: 20,
     includeFontPadding: false,
     textAlign: "center",
     textAlignVertical: "center",
-    width: 44,
-    height: 44,
-    lineHeight: 44
+    width: 38,
+    height: 38,
+    lineHeight: 38
   },
   ghostButtonTextDisabled: {
     opacity: 0.55
   },
   ghostButtonDark: {
-    backgroundColor: "#22252b"
+    backgroundColor: "rgba(148, 163, 184, 0.12)",
+    borderColor: "rgba(148, 163, 184, 0.22)"
   },
   ghostButtonTextDark: {
     color: "#e5e7eb"
@@ -4276,18 +4276,17 @@ const styles = StyleSheet.create({
   settingsSegTextActive: {
     color: ACCENT_BLUE
   },
-  settingsActionBtn: {
-    height: 34,
-    paddingHorizontal: 12,
-    borderRadius: 12,
-    backgroundColor: "#eef2ff",
+  settingsRefreshBtn: {
+    height: 44,
+    borderRadius: 14,
+    backgroundColor: "#eff6ff",
     borderWidth: 1,
-    borderColor: "#dbeafe",
+    borderColor: "#bfdbfe",
     alignItems: "center",
     justifyContent: "center"
   },
-  settingsActionText: {
-    fontSize: 12,
+  settingsRefreshText: {
+    fontSize: 13,
     fontWeight: "900",
     color: ACCENT_BLUE
   },
