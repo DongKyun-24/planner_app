@@ -598,16 +598,6 @@ function WindowTabs({
                   <Text style={styles.sheetBtnPrimaryText}>저장</Text>
                 </Pressable>
               </View>
-              <Pressable
-                onPress={() => {
-                  if (isEditing) Keyboard.dismiss()
-                  setIsEditing((prev) => !prev)
-                }}
-                style={styles.memoEditBtn}
-                hitSlop={8}
-              >
-                <Text style={styles.memoEditBtnText}>{isEditing ? "완료" : "편집"}</Text>
-              </Pressable>
             </View>
             <TextInput
               value={draftTitle}
