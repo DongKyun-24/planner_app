@@ -2913,7 +2913,7 @@ const styles = StyleSheet.create({
     gap: 10
   },
   headerTitleWrapNoLogo: {
-    paddingLeft: 5
+    paddingLeft: 15
   },
   headerLogo: {
     width: 38,
