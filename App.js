@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Constants from "expo-constants"
 import AsyncStorage from "@react-native-async-storage/async-storage"
 import { createClient } from "@supabase/supabase-js"
@@ -6,6 +6,7 @@ import DateTimePicker from "@react-native-community/datetimepicker"
 import {
   ActivityIndicator,
   Alert,
+  Keyboard,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -68,6 +69,8 @@ const Tab = createBottomTabNavigator()
 const DEFAULT_WINDOWS = [{ id: "all", title: "통합", color: ACCENT_BLUE, fixed: true }]
 const AUTH_STORAGE_KEY = "plannerMobile.auth.v1"
 const CLIENT_ID_KEY = "plannerMobile.clientId.v1"
+const UI_THEME_KEY = "plannerMobile.ui.theme.v1"
+const UI_FONT_SCALE_KEY = "plannerMobile.ui.fontScale.v1"
 
 function pad2(value) {
   return String(value).padStart(2, "0")
@@ -232,9 +235,16 @@ function Header({
   const isDark = tone === "dark"
   return (
     <View style={styles.header}>
-      <View>
-        <Text style={[styles.title, isDark ? styles.titleDark : null, titleStyle]}>{title}</Text>
-        {subtitle ? <Text style={[styles.subtitle, isDark ? styles.subtitleDark : null]}>{subtitle}</Text> : null}
+      <View style={styles.headerLeft}>
+        <View style={[styles.headerLogo, isDark ? styles.headerLogoDark : null]}>
+          <Text style={styles.headerLogoText}>P</Text>
+        </View>
+        <View>
+          <Text style={[styles.title, isDark ? styles.titleDark : null, titleStyle]}>{title}</Text>
+          <Text style={[styles.subtitle, isDark ? styles.subtitleDark : null]}>
+            {subtitle ?? "for users who like typing"}
+          </Text>
+        </View>
       </View>
       <View style={[styles.headerButtons, buttonsStyle]}>
         {onRefresh ? (
@@ -261,13 +271,86 @@ function Header({
             style={[styles.ghostButton, isDark ? styles.ghostButtonDark : null]}
             onPress={onSignOut}
             accessibilityRole="button"
-            accessibilityLabel="Sign out"
+            accessibilityLabel="Settings"
           >
-            <Text style={[styles.ghostButtonText, isDark ? styles.ghostButtonTextDark : null]}>⎋</Text>
+            <Text style={[styles.ghostButtonText, isDark ? styles.ghostButtonTextDark : null]}>⚙</Text>
           </TouchableOpacity>
         ) : null}
       </View>
     </View>
+  )
+}
+
+function SettingsSheet({ visible, themeMode, fontScale, onChangeTheme, onChangeFontScale, onLogout, onClose }) {
+  return (
+    <Modal transparent animationType="fade" visible={visible} statusBarTranslucent>
+      <View style={styles.sheetOverlay}>
+        <Pressable style={styles.sheetBackdrop} onPress={onClose} />
+        <View style={styles.sheetCard}>
+          <View style={styles.sheetHeader}>
+            <Text style={styles.sheetTitle}>설정</Text>
+            <View style={styles.sheetHeaderRight}>
+              <Pressable onPress={onClose} style={styles.sheetBtnGhost}>
+                <Text style={styles.sheetBtnGhostText}>닫기</Text>
+              </Pressable>
+            </View>
+          </View>
+
+          <View style={styles.settingsList}>
+            <View style={styles.settingsRow}>
+              <Text style={styles.settingsLabel}>테마</Text>
+              <View style={styles.settingsSegment}>
+                <Pressable
+                  onPress={() => onChangeTheme?.("light")}
+                  style={[styles.settingsSegBtn, themeMode === "light" ? styles.settingsSegBtnActive : null]}
+                >
+                  <Text
+                    style={[styles.settingsSegText, themeMode === "light" ? styles.settingsSegTextActive : null]}
+                  >
+                    라이트
+                  </Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => onChangeTheme?.("dark")}
+                  style={[styles.settingsSegBtn, themeMode === "dark" ? styles.settingsSegBtnActive : null]}
+                >
+                  <Text
+                    style={[styles.settingsSegText, themeMode === "dark" ? styles.settingsSegTextActive : null]}
+                  >
+                    다크
+                  </Text>
+                </Pressable>
+              </View>
+            </View>
+
+            <View style={styles.settingsRow}>
+              <Text style={styles.settingsLabel}>글씨 크기</Text>
+              <View style={styles.settingsSegment}>
+                {[0.9, 1, 1.1].map((scale) => {
+                  const active = Math.abs((fontScale ?? 1) - scale) < 0.001
+                  const label = scale === 0.9 ? "작게" : scale === 1 ? "보통" : "크게"
+                  return (
+                    <Pressable
+                      key={String(scale)}
+                      onPress={() => onChangeFontScale?.(scale)}
+                      style={[styles.settingsSegBtn, active ? styles.settingsSegBtnActive : null]}
+                    >
+                      <Text style={[styles.settingsSegText, active ? styles.settingsSegTextActive : null]}>
+                        {label}
+                      </Text>
+                    </Pressable>
+                  )
+                })}
+              </View>
+            </View>
+
+            <Pressable style={styles.settingsLogoutBtn} onPress={onLogout}>
+              <Text style={styles.settingsLogoutText}>로그아웃</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
   )
 }
 
@@ -338,7 +421,7 @@ function WindowTabs({
     if (!menuWindow) return
     const title = String(menuWindow.title ?? "")
     setMenuVisible(false)
-    Alert.alert("삭제", `"${title}" 탭을 삭제할까요?\n(해당 탭 일정은 삭제됩니다)` , [
+    Alert.alert("삭제", `"${title}" 탭을 삭제할까요?\n(해당 탭의 일정/메모는 모두 삭제됩니다)` , [
       { text: "취소", style: "cancel" },
       {
         text: "삭제",
@@ -408,6 +491,7 @@ function WindowTabs({
           })}
         </ScrollView>
 
+        <View pointerEvents="none" style={[styles.tabAddMask, isDark ? styles.tabAddMaskDark : null]} />
         <Pressable onPress={openAdd} style={styles.tabAddBtn} hitSlop={10}>
           <Text style={styles.tabAddText}>＋</Text>
         </Pressable>
@@ -514,6 +598,16 @@ function WindowTabs({
                   <Text style={styles.sheetBtnPrimaryText}>저장</Text>
                 </Pressable>
               </View>
+              <Pressable
+                onPress={() => {
+                  if (isEditing) Keyboard.dismiss()
+                  setIsEditing((prev) => !prev)
+                }}
+                style={styles.memoEditBtn}
+                hitSlop={8}
+              >
+                <Text style={styles.memoEditBtnText}>{isEditing ? "완료" : "편집"}</Text>
+              </Pressable>
             </View>
             <TextInput
               value={draftTitle}
@@ -569,6 +663,8 @@ function ListScreen({
   loading,
   onRefresh,
   onSignOut,
+  tone = "light",
+  fontScale = 1,
   windows,
   activeTabId,
   onSelectTab,
@@ -581,6 +677,12 @@ function ListScreen({
   onAddPlan,
   onEditPlan
 }) {
+  const scale = useMemo(() => {
+    const n = Number(fontScale)
+    if (!Number.isFinite(n)) return 1
+    return Math.max(0.85, Math.min(1.25, n))
+  }, [fontScale])
+  const fs = useCallback((n) => Math.round(n * scale), [scale])
   const today = new Date()
   const [viewYear, setViewYear] = useState(today.getFullYear())
   const [viewMonth, setViewMonth] = useState(today.getMonth() + 1)
@@ -669,7 +771,7 @@ function ListScreen({
         loading={loading}
         onRefresh={onRefresh}
         onSignOut={onSignOut}
-        tone="light"
+        tone={tone}
         titleStyle={styles.calendarTitleOffset}
         buttonsStyle={styles.calendarButtonsOffset}
       />
@@ -681,7 +783,7 @@ function ListScreen({
         onRenameWindow={onRenameWindow}
         onDeleteWindow={onDeleteWindow}
         onChangeWindowColor={onChangeWindowColor}
-        tone="light"
+        tone={tone}
       />
       <View style={styles.listMonthBar}>
         <View style={styles.listMonthLeftGroup}>
@@ -727,11 +829,13 @@ function ListScreen({
             return (
               <Pressable style={styles.itemRow} onPress={() => onEditPlan?.(item)}>
                 <View style={styles.itemLeftCol}>
-                  <Text style={time ? styles.itemTimeText : styles.itemTimeTextEmpty}>{time || "\u00A0"}</Text>
+                  <Text style={time ? [styles.itemTimeText, { fontSize: fs(12) }] : [styles.itemTimeTextEmpty, { fontSize: fs(12) }]}>
+                    {time || " "}
+                  </Text>
                 </View>
                 <View style={styles.itemMainCol}>
                   <View style={styles.itemTopRow}>
-                    <Text style={styles.itemTitle} numberOfLines={1}>
+                    <Text style={[styles.itemTitle, { fontSize: fs(14) }]} numberOfLines={1}>
                       {content}
                     </Text>
                     {!isGeneral ? (
@@ -760,7 +864,7 @@ function ListScreen({
               >
                 <View style={styles.sectionHeaderRow}>
                   <View style={styles.sectionHeaderLeft}>
-                    <Text style={[styles.sectionHeaderDateText, { color }]}>{formatDateMD(key)}</Text>
+                    <Text style={[styles.sectionHeaderDateText, { color, fontSize: fs(14) }]}>{formatDateMD(key)}</Text>
                     {dow ? (
                       <View
                         style={[
@@ -786,7 +890,7 @@ function ListScreen({
                   <View style={styles.sectionHeaderRight}>
                     {holidayName ? (
                       <View style={styles.sectionHeaderHolidayBadge}>
-                        <Text numberOfLines={1} style={styles.sectionHeaderHolidayBadgeText}>
+                        <Text numberOfLines={1} style={[styles.sectionHeaderHolidayBadgeText, { fontSize: fs(11) }]}>
                           {holidayName}
                         </Text>
                       </View>
@@ -819,6 +923,8 @@ function MemoScreen({
   loading,
   onRefresh,
   onSignOut,
+  tone = "light",
+  fontScale = 1,
   windows,
   rightMemos,
   activeTabId,
@@ -829,14 +935,27 @@ function MemoScreen({
   onChangeWindowColor,
   onSaveMemo
 }) {
+  const insets = useSafeAreaInsets()
+  const scale = useMemo(() => {
+    const n = Number(fontScale)
+    if (!Number.isFinite(n)) return 1
+    return Math.max(0.85, Math.min(1.25, n))
+  }, [fontScale])
   const [draft, setDraft] = useState("")
   const [dirty, setDirty] = useState(false)
+  const [isEditing, setIsEditing] = useState(false)
   const draftRef = useRef("")
   const dirtyRef = useRef(false)
+  const inputRef = useRef(null)
   const prevTabRef = useRef(activeTabId)
   const lastAppliedTabRef = useRef(activeTabId)
   const saveTimerRef = useRef(null)
   const saveSeqRef = useRef(0)
+
+  useEffect(() => {
+    setIsEditing(false)
+    Keyboard.dismiss()
+  }, [activeTabId])
 
   async function saveForTab(tabId, text) {
     if (!tabId || tabId === "all") return
@@ -899,6 +1018,29 @@ function MemoScreen({
     }
   }, [onSaveMemo])
 
+  const placeholder = useMemo(() => {
+    if (activeTabId === "all") return "[탭제목]\n내용을 입력하세요"
+    return "메모를 입력하세요"
+  }, [activeTabId])
+
+  function scheduleSave(nextText) {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+    saveTimerRef.current = setTimeout(() => {
+      const contentToSave = String(nextText ?? "")
+      saveSeqRef.current += 1
+      const seq = saveSeqRef.current
+      Promise.resolve(activeTabId === "all" ? saveForAll(contentToSave) : saveForTab(activeTabId, contentToSave))
+        .catch((_e) => {
+          // ignore
+        })
+        .finally(() => {
+          if (saveSeqRef.current !== seq) return
+          dirtyRef.current = false
+          setDirty(false)
+        })
+    }, 700)
+  }
+
   return (
     <SafeAreaView style={[styles.container, styles.calendarFill]}>
       <Header
@@ -906,7 +1048,7 @@ function MemoScreen({
         loading={loading}
         onRefresh={onRefresh}
         onSignOut={onSignOut}
-        tone="light"
+        tone={tone}
         titleStyle={styles.calendarTitleOffset}
         buttonsStyle={styles.calendarButtonsOffset}
       />
@@ -918,68 +1060,82 @@ function MemoScreen({
         onRenameWindow={onRenameWindow}
         onDeleteWindow={onDeleteWindow}
         onChangeWindowColor={onChangeWindowColor}
-        tone="light"
+        tone={tone}
       />
       <View style={[styles.card, styles.memoCard]}>
         {loading ? <ActivityIndicator size="small" color="#3b82f6" /> : null}
-        {false ? (
-          <ScrollView contentContainerStyle={styles.memoAllList}>
-            {(windows ?? [])
-              .filter((w) => w && w.id !== "all")
-              .map((w) => {
-                const text = String(rightMemos?.[w.id] ?? "").trim()
-                return (
-                  <View key={w.id} style={styles.memoAllCard}>
-                    <View style={styles.memoAllHeader}>
-                      <View style={[styles.memoAllDot, { backgroundColor: w.color || "#94a3b8" }]} />
-                      <Text style={styles.memoAllTitle}>{w.title}</Text>
-                    </View>
-                    {text ? (
-                      <Text style={styles.memoAllBody}>{text}</Text>
-                    ) : (
-                      <Text style={styles.memoAllEmpty}>메모 없음</Text>
-                    )}
-                  </View>
-                )
-              })}
-          </ScrollView>
-        ) : (
-          <View style={styles.memoEditorWrap}>
-            <View style={styles.memoEditorBar}>
-              <Text style={styles.memoEditorTitle}>{activeTabId === "all" ? "통합 메모" : "메모"}</Text>
-            </View>
-            <TextInput
-              value={draft}
-              onChangeText={(t) => {
-                const next = String(t ?? "")
-                draftRef.current = next
-                dirtyRef.current = true
-                setDraft(next)
-                if (!dirty) setDirty(true)
-
-                if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
-                saveTimerRef.current = setTimeout(() => {
-                  const contentToSave = draftRef.current
-                  saveSeqRef.current += 1
-                  const seq = saveSeqRef.current
-                  Promise.resolve(activeTabId === "all" ? saveForAll(contentToSave) : saveForTab(activeTabId, contentToSave))
-                    .catch((_e) => {
-                      // ignore
-                    })
-                    .finally(() => {
-                      if (saveSeqRef.current !== seq) return
-                      dirtyRef.current = false
-                      setDirty(false)
-                    })
-                }, 700)
+        <View style={styles.memoEditorWrap}>
+          <View style={styles.memoEditorBar}>
+            <Text style={styles.memoEditorTitle}>{activeTabId === "all" ? "통합 메모" : "메모"}</Text>
+            <Pressable
+              style={styles.memoEditBtn}
+              onPress={() => {
+                const next = !isEditing
+                setIsEditing(next)
+                if (next) setTimeout(() => inputRef.current?.focus?.(), 50)
+                else Keyboard.dismiss()
               }}
-              placeholder={activeTabId === "all" ? "[탭명] 아래에 메모를 입력하세요" : "메모를 입력하세요"}
-              multiline
-              textAlignVertical="top"
-              style={styles.memoInput}
-            />
+            >
+              <Text style={styles.memoEditBtnText}>{isEditing ? "완료" : "편집"}</Text>
+            </Pressable>
           </View>
-        )}
+
+          {!isEditing ? (
+            <ScrollView
+              style={styles.memoPaper}
+              contentContainerStyle={styles.memoPaperContent}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator
+            >
+              {String(draft ?? "").trim() ? (
+                <Text
+                  selectable
+                  style={[styles.memoText, { fontSize: Math.round(14 * scale), lineHeight: Math.round(20 * scale) }]}
+                >
+                  {draft}
+                </Text>
+              ) : (
+                <View style={styles.memoEmpty}>
+                  <Text style={styles.memoEmptyTitle}>메모</Text>
+                  <Text style={styles.memoEmptySub}>오른쪽 상단 ‘편집’으로 작성하세요.</Text>
+                </View>
+              )}
+            </ScrollView>
+          ) : (
+            <KeyboardAvoidingView
+              style={{ flex: 1 }}
+              behavior={Platform.OS === "ios" ? "padding" : "height"}
+              keyboardVerticalOffset={Platform.OS === "ios" ? insets.top + 8 : 0}
+            >
+              <TextInput
+                ref={inputRef}
+                value={draft}
+                onChangeText={(t) => {
+                  const next = String(t ?? "")
+                  draftRef.current = next
+                  dirtyRef.current = true
+                  setDraft(next)
+                  if (!dirty) setDirty(true)
+                  scheduleSave(next)
+                }}
+                placeholder={placeholder}
+                multiline
+                scrollEnabled
+                disableFullscreenUI
+                underlineColorAndroid="transparent"
+                textAlignVertical="top"
+                style={[
+                  styles.memoInput,
+                  {
+                    fontSize: Math.round(14 * scale),
+                    lineHeight: Math.round(20 * scale),
+                    paddingBottom: Math.max(16, insets.bottom + 12)
+                  }
+                ]}
+              />
+            </KeyboardAvoidingView>
+          )}
+        </View>
       </View>
     </SafeAreaView>
   )
@@ -1077,7 +1233,7 @@ function PlanEditorModal({ visible, draft, windows, onClose, onSave, onDelete })
               }}
             >
               <View style={styles.editorPickerLeft}>
-                <Text style={styles.editorPickerIcon}>📅</Text>
+                <View style={styles.editorPickerIconSpacer} />
                 <Text style={styles.editorPickerValue}>
                   {date} {weekdayLabel(date)}
                 </Text>
@@ -1123,7 +1279,7 @@ function PlanEditorModal({ visible, draft, windows, onClose, onSave, onDelete })
               }}
             >
               <View style={styles.editorPickerLeft}>
-                <Text style={styles.editorPickerIcon}>⏰</Text>
+                <View style={styles.editorPickerIconSpacer} />
                 <Text style={styles.editorPickerValue}>{time ? timeDisplay : "시간 선택 안함"}</Text>
               </View>
               <View style={styles.editorPickerRight}>
@@ -1150,6 +1306,9 @@ function PlanEditorModal({ visible, draft, windows, onClose, onSave, onDelete })
               placeholderTextColor="#9aa3b2"
               style={[styles.input, styles.editorTextarea]}
               multiline
+              scrollEnabled
+              disableFullscreenUI
+              underlineColorAndroid="transparent"
             />
           </View>
 
@@ -1269,6 +1428,7 @@ function CalendarScreen({
   loading,
   onRefresh,
   onSignOut,
+  tone = "light",
   windows,
   activeTabId,
   onSelectTab,
@@ -1365,7 +1525,7 @@ function CalendarScreen({
         loading={loading}
         onRefresh={onRefresh}
         onSignOut={onSignOut}
-        tone="light"
+        tone={tone}
         titleStyle={styles.calendarTitleOffset}
         buttonsStyle={styles.calendarButtonsOffset}
       />
@@ -1377,7 +1537,7 @@ function CalendarScreen({
         onRenameWindow={onRenameWindow}
         onDeleteWindow={onDeleteWindow}
         onChangeWindowColor={onChangeWindowColor}
-        tone="light"
+        tone={tone}
       />
       <View style={[styles.card, styles.calendarCard]}>
           <View style={styles.calendarHeaderWrap}>
@@ -1592,6 +1752,9 @@ function AppInner() {
   const [planEditorVisible, setPlanEditorVisible] = useState(false)
   const [planDraft, setPlanDraft] = useState(null)
   const [activeScreen, setActiveScreen] = useState("List")
+  const [settingsVisible, setSettingsVisible] = useState(false)
+  const [themeMode, setThemeMode] = useState("light") // "light" | "dark"
+  const [fontScale, setFontScale] = useState(1)
   const lastCalendarDateKeyRef = useRef(null)
 
   const memoYear = new Date().getFullYear()
@@ -1761,6 +1924,43 @@ function AppInner() {
     hydrate()
     return () => {
       mounted = false
+    }
+  }, [])
+
+  useEffect(() => {
+    let mounted = true
+    ;(async () => {
+      try {
+        const rawTheme = await AsyncStorage.getItem(UI_THEME_KEY)
+        const rawFont = await AsyncStorage.getItem(UI_FONT_SCALE_KEY)
+        if (!mounted) return
+        if (rawTheme === "dark" || rawTheme === "light") setThemeMode(rawTheme)
+        const parsed = rawFont ? Number(rawFont) : 1
+        if (Number.isFinite(parsed)) setFontScale(Math.max(0.85, Math.min(1.25, parsed)))
+      } catch (_e) {
+        // ignore
+      }
+    })()
+    return () => {
+      mounted = false
+    }
+  }, [])
+
+  const tone = themeMode === "dark" ? "dark" : "light"
+
+  const persistTheme = useCallback(async (next) => {
+    try {
+      await AsyncStorage.setItem(UI_THEME_KEY, next)
+    } catch (_e) {
+      // ignore
+    }
+  }, [])
+
+  const persistFontScale = useCallback(async (next) => {
+    try {
+      await AsyncStorage.setItem(UI_FONT_SCALE_KEY, String(next))
+    } catch (_e) {
+      // ignore
     }
   }, [])
 
@@ -2281,6 +2481,28 @@ function AppInner() {
 
   return (
     <NavigationContainer>
+      <SettingsSheet
+        visible={settingsVisible}
+        themeMode={themeMode}
+        fontScale={fontScale}
+        onChangeTheme={(next) => {
+          const mode = next === "dark" ? "dark" : "light"
+          setThemeMode(mode)
+          persistTheme(mode)
+        }}
+        onChangeFontScale={(next) => {
+          const n = Number(next)
+          if (!Number.isFinite(n)) return
+          const clamped = Math.max(0.85, Math.min(1.25, n))
+          setFontScale(clamped)
+          persistFontScale(clamped)
+        }}
+        onLogout={() => {
+          setSettingsVisible(false)
+          handleSignOut()
+        }}
+        onClose={() => setSettingsVisible(false)}
+      />
       <PlanEditorModal
         visible={planEditorVisible}
         draft={planDraft}
@@ -2350,7 +2572,9 @@ function AppInner() {
                 loadWindows(session?.user?.id)
                 loadRightMemos(session?.user?.id, memoYear)
               }}
-              onSignOut={handleSignOut}
+              onSignOut={() => setSettingsVisible(true)}
+              tone={tone}
+              fontScale={fontScale}
             />
           )}
         </Tab.Screen>
@@ -2373,7 +2597,9 @@ function AppInner() {
                 loadWindows(session?.user?.id)
                 loadRightMemos(session?.user?.id, memoYear)
               }}
-              onSignOut={handleSignOut}
+              onSignOut={() => setSettingsVisible(true)}
+              tone={tone}
+              fontScale={fontScale}
             />
           )}
         </Tab.Screen>
@@ -2401,7 +2627,8 @@ function AppInner() {
                 loadWindows(session?.user?.id)
                 loadRightMemos(session?.user?.id, memoYear)
               }}
-              onSignOut={handleSignOut}
+              onSignOut={() => setSettingsVisible(true)}
+              tone={tone}
             />
           )}
         </Tab.Screen>
@@ -2630,11 +2857,33 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     marginTop: 6
   },
+  headerLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10
+  },
+  headerLogo: {
+    width: 34,
+    height: 34,
+    borderRadius: 12,
+    backgroundColor: ACCENT_BLUE,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  headerLogoDark: {
+    backgroundColor: "#1d4ed8"
+  },
+  headerLogoText: {
+    color: "#ffffff",
+    fontWeight: "900",
+    fontSize: 16,
+    includeFontPadding: false
+  },
   headerButtons: {
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
-    marginRight: 6
+    marginRight: 14
   },
   title: {
     fontSize: 24,
@@ -2662,7 +2911,19 @@ const styles = StyleSheet.create({
   },
   tabBarInner: {
     position: "relative",
-    height: 44
+    height: 44,
+    overflow: "hidden"
+  },
+  tabAddMask: {
+    position: "absolute",
+    right: 0,
+    top: 0,
+    bottom: 0,
+    width: 52,
+    backgroundColor: "#eef2f7"
+  },
+  tabAddMaskDark: {
+    backgroundColor: "#1f2937"
   },
   tabBarWrapDark: {
     backgroundColor: "#1f2937",
@@ -2702,7 +2963,7 @@ const styles = StyleSheet.create({
     marginTop: -1
   },
   tabMenuBtn: {
-    marginLeft: 6,
+    marginLeft: 8,
     height: 22,
     width: 20,
     alignItems: "center",
@@ -2798,9 +3059,12 @@ const styles = StyleSheet.create({
     justifyContent: "center"
   },
   listMonthNavText: {
-    fontSize: 20,
+    fontSize: 22,
     fontWeight: "900",
-    color: ACCENT_BLUE
+    color: ACCENT_BLUE,
+    includeFontPadding: false,
+    textAlign: "center",
+    lineHeight: 24
   },
   listMonthRightGroup: {
     flexDirection: "row",
@@ -2808,7 +3072,7 @@ const styles = StyleSheet.create({
     gap: 6
   },
   listMonthText: {
-    fontSize: 16,
+    fontSize: 17,
     fontWeight: "900",
     color: "#0f172a"
   },
@@ -2826,9 +3090,9 @@ const styles = StyleSheet.create({
     height: 32,
     paddingHorizontal: 12,
     borderRadius: 12,
-    backgroundColor: "#dbeafe",
+    backgroundColor: "#eaf2ff",
     borderWidth: 1,
-    borderColor: "#bfdbfe",
+    borderColor: "rgba(43, 103, 199, 0.20)",
     alignItems: "center",
     justifyContent: "center"
   },
@@ -2940,8 +3204,11 @@ const styles = StyleSheet.create({
   ghostButtonText: {
     color: ACCENT_BLUE,
     fontWeight: "900",
-    fontSize: 22,
-    includeFontPadding: false
+    fontSize: 24,
+    includeFontPadding: false,
+    textAlign: "center",
+    lineHeight: 24,
+    marginTop: -1
   },
   ghostButtonTextDisabled: {
     opacity: 0.55
@@ -3051,16 +3318,16 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "flex-start",
     paddingVertical: 9,
-    paddingHorizontal: 12,
-    gap: 10,
+    paddingHorizontal: 8,
+    gap: 8,
     borderBottomWidth: 1,
     borderBottomColor: "#eef2f7"
   },
   itemLeftCol: {
-    width: 64,
+    width: 54,
     paddingTop: 1,
     alignItems: "flex-end",
-    paddingRight: 10
+    paddingRight: 5
   },
   itemTimeText: {
     fontSize: 12,
@@ -3072,7 +3339,8 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "900",
     color: "#94a3b8",
-    textAlign: "right"
+    textAlign: "right",
+    opacity: 0
   },
   itemMainCol: {
     flex: 1
@@ -3175,6 +3443,21 @@ const styles = StyleSheet.create({
     fontWeight: "900",
     color: "#0f172a"
   },
+  memoEditBtn: {
+    height: 28,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: "#eff6ff",
+    borderWidth: 1,
+    borderColor: "#dbeafe",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  memoEditBtnText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: ACCENT_BLUE
+  },
   memoInput: {
     flex: 1,
     borderRadius: 16,
@@ -3194,6 +3477,9 @@ const styles = StyleSheet.create({
     borderColor: "#eef2f7",
     padding: 14,
     minHeight: 240
+  },
+  memoPaperContent: {
+    flexGrow: 1
   },
   memoText: {
     fontSize: 14,
@@ -3669,6 +3955,10 @@ const styles = StyleSheet.create({
   editorPickerIcon: {
     fontSize: 14
   },
+  editorPickerIconSpacer: {
+    width: 16,
+    height: 16
+  },
   editorPickerValue: {
     fontSize: 14,
     fontWeight: "800",
@@ -3754,6 +4044,62 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "900",
     color: "#ffffff"
+  },
+  settingsList: {
+    gap: 14,
+    paddingTop: 4,
+    paddingBottom: 6
+  },
+  settingsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12
+  },
+  settingsLabel: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  settingsSegment: {
+    flexDirection: "row",
+    backgroundColor: "#f1f5f9",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    borderRadius: 12,
+    overflow: "hidden"
+  },
+  settingsSegBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    minWidth: 56,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  settingsSegBtnActive: {
+    backgroundColor: "#ffffff"
+  },
+  settingsSegText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#64748b"
+  },
+  settingsSegTextActive: {
+    color: ACCENT_BLUE
+  },
+  settingsLogoutBtn: {
+    height: 44,
+    borderRadius: 14,
+    backgroundColor: "#fff1f2",
+    borderWidth: 1,
+    borderColor: "#fecdd3",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  settingsLogoutText: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#e11d48"
   },
   sheetPicker: {
     marginBottom: 6
