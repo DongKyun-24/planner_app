@@ -237,6 +237,7 @@ function Header({
     <View style={styles.header}>
       <View style={styles.headerLeft}>
         <View style={[styles.headerLogo, isDark ? styles.headerLogoDark : null]}>
+          <View pointerEvents="none" style={styles.headerLogoHighlight} />
           <Text style={styles.headerLogoText}>P</Text>
         </View>
         <View>
@@ -2894,21 +2895,39 @@ const styles = StyleSheet.create({
     gap: 10
   },
   headerLogo: {
-    width: 34,
-    height: 34,
-    borderRadius: 12,
+    width: 38,
+    height: 38,
+    borderRadius: 14,
     backgroundColor: ACCENT_BLUE,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.28)",
     alignItems: "center",
-    justifyContent: "center"
+    justifyContent: "center",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.12,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 3
   },
   headerLogoDark: {
-    backgroundColor: "#1d4ed8"
+    backgroundColor: "#1d4ed8",
+    borderColor: "rgba(255, 255, 255, 0.18)"
+  },
+  headerLogoHighlight: {
+    position: "absolute",
+    top: 6,
+    left: 6,
+    width: 12,
+    height: 12,
+    borderRadius: 999,
+    backgroundColor: "rgba(255, 255, 255, 0.18)"
   },
   headerLogoText: {
     color: "#ffffff",
     fontWeight: "900",
     fontSize: 16,
-    includeFontPadding: false
+    includeFontPadding: false,
+    textAlign: "center"
   },
   headerButtons: {
     flexDirection: "row",
@@ -3246,11 +3265,13 @@ const styles = StyleSheet.create({
   ghostButtonText: {
     color: ACCENT_BLUE,
     fontWeight: "900",
-    fontSize: 24,
+    fontSize: 22,
     includeFontPadding: false,
     textAlign: "center",
-    lineHeight: 24,
-    marginTop: -1
+    textAlignVertical: "center",
+    width: 44,
+    height: 44,
+    lineHeight: 44
   },
   ghostButtonTextDisabled: {
     opacity: 0.55
