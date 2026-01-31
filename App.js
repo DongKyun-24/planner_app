@@ -257,7 +257,7 @@ function Header({
     <View style={styles.header}>
       <View style={styles.headerLeft}>
         {showLogo ? <LogoMark tone={tone} size={38} /> : null}
-        <View>
+        <View style={!showLogo ? styles.headerTitleWrapNoLogo : null}>
           <Text style={[styles.title, isDark ? styles.titleDark : null, titleStyle]}>{title}</Text>
           <Text style={[styles.subtitle, isDark ? styles.subtitleDark : null]}>
             {subtitle ?? "for users who like typing"}
@@ -2911,6 +2911,9 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 10
+  },
+  headerTitleWrapNoLogo: {
+    paddingLeft: 5
   },
   headerLogo: {
     width: 38,
