@@ -20,14 +20,22 @@
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "package": "com.anonymous.plannermobile"
     },
     "web": {
       "favicon": "./assets/favicon.png"
     },
     "extra": {
       "supabaseUrl": "https://gvpjzoeqmchfwheihayf.supabase.co",
-      "supabaseAnonKey": "sb_publishable_YFxn2r46TgDtQACmUW73wA_7eOZOop8"
-    }
+      "supabaseAnonKey": "sb_publishable_YFxn2r46TgDtQACmUW73wA_7eOZOop8",
+      "eas": {
+        "projectId": "6644315e-c4c6-41a5-9b99-16fe63d4c6b8"
+      }
+    },
+    "plugins": [
+      "@react-native-community/datetimepicker",
+      "expo-notifications"
+    ]
   }
 }
