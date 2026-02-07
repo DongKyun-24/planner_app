@@ -522,6 +522,13 @@ function formatLine(item) {
   return { time, text }
 }
 
+function isRenderablePlanRow(row) {
+  if (!row || typeof row !== "object") return false
+  const dateKey = String(row?.date ?? "").trim()
+  const content = String(row?.content ?? "").trim()
+  return Boolean(dateKey && content)
+}
+
 function normalizeWindowTitle(value) {
   return String(value ?? "").trim()
 }
@@ -1683,7 +1690,7 @@ function ListScreen({
   const isAllListFiltersSelected = allFilterTitles.length === 0 || listFilterTitles.length === allFilterTitles.length
   const applyListFilter = useCallback(
     (items) => {
-      const list = Array.isArray(items) ? items : []
+      const list = (Array.isArray(items) ? items : []).filter((item) => isRenderablePlanRow(item))
       if (activeTabId !== "all") return list
       const selected = new Set(listFilterTitles)
       return list.filter((item) => {
@@ -3963,7 +3970,7 @@ function CalendarScreen({
   const isAllFiltersSelected = allFilterTitles.length > 0 && calendarFilterTitles.length === allFilterTitles.length
   const applyCalendarFilter = useCallback(
     (items) => {
-      const list = Array.isArray(items) ? items : []
+      const list = (Array.isArray(items) ? items : []).filter((item) => isRenderablePlanRow(item))
       if (activeTabId !== "all") return list
       const selected = new Set(calendarFilterTitles)
       return list.filter((item) => {
