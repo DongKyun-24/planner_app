@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Constants from "expo-constants"
 import * as Notifications from "expo-notifications"
 import AsyncStorage from "@react-native-async-storage/async-storage"
@@ -7,8 +7,11 @@ import DateTimePicker from "@react-native-community/datetimepicker"
 import {
   ActivityIndicator,
   Alert,
+  Animated,
+  BackHandler,
   Keyboard,
   KeyboardAvoidingView,
+  LayoutAnimation,
   Image,
   Modal,
   PanResponder,
@@ -21,9 +24,10 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  UIManager,
   View
 } from "react-native"
-import { NavigationContainer } from "@react-navigation/native"
+import { NavigationContainer, useFocusEffect } from "@react-navigation/native"
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs"
 import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context"
 
@@ -151,11 +155,70 @@ function formatTimeHHMM(dateValue) {
   return `${pad2(dateValue.getHours())}:${pad2(dateValue.getMinutes())}`
 }
 
-function formatTimeForDisplay(timeText) {
-  const match = String(timeText ?? "").trim().match(/^(\d{1,2}):(\d{2})$/)
+function normalizeClockTime(value) {
+  const match = String(value ?? "")
+    .trim()
+    .match(/^(\d{1,2}):(\d{2})$/)
   if (!match) return ""
-  const hour24 = Math.min(23, Math.max(0, Number(match[1])))
-  const minute = Math.min(59, Math.max(0, Number(match[2])))
+  const hour = Number(match[1])
+  const minute = Number(match[2])
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return ""
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return ""
+  return `${pad2(hour)}:${pad2(minute)}`
+}
+
+function parseTimeSpanInput(value) {
+  const raw = String(value ?? "").trim()
+  if (!raw) return { startTime: "", endTime: "", hasInput: false, isValid: true }
+  const single = normalizeClockTime(raw)
+  if (single) return { startTime: single, endTime: "", hasInput: true, isValid: true }
+  const match = raw.match(/^(\d{1,2}):(\d{2})\s*[~-]\s*(\d{1,2}):(\d{2})$/)
+  if (!match) return { startTime: "", endTime: "", hasInput: true, isValid: false }
+  const startTime = normalizeClockTime(`${match[1]}:${match[2]}`)
+  const endTime = normalizeClockTime(`${match[3]}:${match[4]}`)
+  if (!startTime) return { startTime: "", endTime: "", hasInput: true, isValid: false }
+  if (!endTime || endTime === startTime) return { startTime, endTime: "", hasInput: true, isValid: false }
+  return { startTime, endTime, hasInput: true, isValid: true }
+}
+
+function normalizePlanTimeRange(row) {
+  const parsed = parseTimeSpanInput(row?.time)
+  const explicitEnd = normalizeClockTime(row?.end_time ?? row?.endTime)
+  const startTime = parsed.startTime
+  if (!startTime) return { time: "", endTime: "" }
+  let endTime = explicitEnd || parsed.endTime
+  if (endTime && endTime === startTime) endTime = ""
+  return { time: startTime, endTime }
+}
+
+function buildPlanTimeText(time, endTime = "") {
+  const start = normalizeClockTime(time)
+  if (!start) return ""
+  const end = normalizeClockTime(endTime)
+  if (end && end !== start) return `${start} ${end}`
+  return start
+}
+
+function buildPlanTimeTextFromRow(row) {
+  const { time, endTime } = normalizePlanTimeRange(row)
+  return buildPlanTimeText(time, endTime)
+}
+
+function formatPlanTimeForDisplay(row) {
+  const { time, endTime } = normalizePlanTimeRange(row)
+  const startLabel = formatTimeForDisplay(time)
+  if (!startLabel) return ""
+  const endLabel = formatTimeForDisplay(endTime)
+  if (endLabel) return `${startLabel} ${endLabel}`
+  return startLabel
+}
+
+function formatTimeForDisplay(timeText) {
+  const normalized = normalizeClockTime(timeText)
+  const match = normalized.match(/^(\d{2}):(\d{2})$/)
+  if (!match) return ""
+  const hour24 = Number(match[1])
+  const minute = Number(match[2])
   const ampmLabel = hour24 >= 12 ? "오후" : "오전"
   const hour12 = hour24 % 12 === 0 ? 12 : hour24 % 12
   return `${ampmLabel} ${pad2(hour12)}:${pad2(minute)}`
@@ -164,12 +227,11 @@ function formatTimeForDisplay(timeText) {
 function planDateTimeFromRow(row) {
   const date = parseDateKey(String(row?.date ?? ""))
   if (!date) return null
-  const match = String(row?.time ?? "")
-    .trim()
-    .match(/^(\d{1,2}):(\d{2})$/)
+  const { time } = normalizePlanTimeRange(row)
+  const match = String(time).match(/^(\d{2}):(\d{2})$/)
   if (!match) return null
-  const hour = Math.min(23, Math.max(0, Number(match[1])))
-  const minute = Math.min(59, Math.max(0, Number(match[2])))
+  const hour = Number(match[1])
+  const minute = Number(match[2])
   if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null
   const next = new Date(date)
   next.setHours(hour, minute, 0, 0)
@@ -455,7 +517,7 @@ function splitCombinedMemoText(text, windows) {
 }
 
 function formatLine(item) {
-  const time = item?.time ? String(item.time).trim() : ""
+  const time = buildPlanTimeTextFromRow(item)
   const text = String(item?.content ?? "").trim()
   return { time, text }
 }
@@ -484,25 +546,109 @@ function parseMemoSections(text) {
 }
 
 function timeToMinutes(value) {
-  const trimmed = String(value ?? "").trim()
-  const match = trimmed.match(/^(\d{1,2}):(\d{2})/)
+  const { startTime } = parseTimeSpanInput(value)
+  const match = String(startTime).match(/^(\d{2}):(\d{2})$/)
   if (!match) return Number.MAX_SAFE_INTEGER
   return Number(match[1]) * 60 + Number(match[2])
 }
 
-function sortItems(a, b) {
-  const ta = timeToMinutes(a?.time)
-  const tb = timeToMinutes(b?.time)
-  if (ta !== tb) return ta - tb
-  const ca = String(a?.category_id ?? "")
-  const cb = String(b?.category_id ?? "")
-  if (ca !== cb) return ca.localeCompare(cb, "ko")
-  const at = String(a?.content ?? "").trim()
-  const bt = String(b?.content ?? "").trim()
-  const aNum = /^\d+$/.test(at) ? Number(at) : null
-  const bNum = /^\d+$/.test(bt) ? Number(bt) : null
-  if (aNum != null && bNum != null) return aNum - bNum
-  return at.localeCompare(bt, "ko")
+function parseSortOrderValue(value) {
+  if (value == null) return null
+  if (typeof value === "string") {
+    const trimmed = value.trim()
+    if (!trimmed) return null
+    const n = Number(trimmed)
+    return Number.isFinite(n) ? n : null
+  }
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+function parseTimestampMs(value) {
+  if (value == null) return null
+  if (value instanceof Date) {
+    const ms = value.getTime()
+    return Number.isNaN(ms) ? null : ms
+  }
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  const ms = Date.parse(String(value))
+  return Number.isNaN(ms) ? null : ms
+}
+
+function sortItemsByTimeAndOrder(items) {
+  const list = Array.isArray(items) ? items : []
+  if (list.length <= 1) return list
+  const timed = []
+  const noTime = []
+  for (const row of list) {
+    const minutes = timeToMinutes(row?.time)
+    if (minutes !== Number.MAX_SAFE_INTEGER) timed.push({ row, minutes })
+    else noTime.push(row)
+  }
+  timed.sort((a, b) => a.minutes - b.minutes)
+
+  const noTimeMeta = noTime.map((row, idx) => {
+    const sortOrder = parseSortOrderValue(row?.sort_order ?? row?.sortOrder ?? row?.order)
+    const createdAtMs = parseTimestampMs(row?.created_at ?? row?.createdAt)
+    const updatedAtMs = parseTimestampMs(row?.updated_at ?? row?.updatedAt)
+    const id = row?.id != null ? String(row.id) : ""
+    return { row, sortOrder, createdAtMs, updatedAtMs, id, idx }
+  })
+  const hasSortOrder = noTimeMeta.some((item) => item.sortOrder != null)
+  const hasFallbackOrder = noTimeMeta.some((item) => item.createdAtMs != null || item.updatedAtMs != null)
+  let noTimeSorted = noTime
+  if (hasSortOrder) {
+    noTimeSorted = [...noTimeMeta].sort((a, b) => {
+      const oa = a.sortOrder
+      const ob = b.sortOrder
+      if (!(oa == null && ob == null)) {
+        if (oa == null) return 1
+        if (ob == null) return -1
+        if (oa !== ob) return oa - ob
+      }
+      const ca = a.createdAtMs
+      const cb = b.createdAtMs
+      if (ca != null || cb != null) {
+        if (ca == null) return 1
+        if (cb == null) return -1
+        if (ca !== cb) return ca - cb
+      }
+      const ua = a.updatedAtMs
+      const ub = b.updatedAtMs
+      if (ua != null || ub != null) {
+        if (ua == null) return 1
+        if (ub == null) return -1
+        if (ua !== ub) return ua - ub
+      }
+      if (a.id && b.id && a.id !== b.id) return a.id.localeCompare(b.id, "en")
+      if (a.id && !b.id) return -1
+      if (!a.id && b.id) return 1
+      return a.idx - b.idx
+    }).map((entry) => entry.row)
+  } else if (hasFallbackOrder) {
+    noTimeSorted = [...noTimeMeta].sort((a, b) => {
+      const ca = a.createdAtMs
+      const cb = b.createdAtMs
+      if (ca != null || cb != null) {
+        if (ca == null) return 1
+        if (cb == null) return -1
+        if (ca !== cb) return ca - cb
+      }
+      const ua = a.updatedAtMs
+      const ub = b.updatedAtMs
+      if (ua != null || ub != null) {
+        if (ua == null) return 1
+        if (ub == null) return -1
+        if (ua !== ub) return ua - ub
+      }
+      if (a.id && b.id && a.id !== b.id) return a.id.localeCompare(b.id, "en")
+      if (a.id && !b.id) return -1
+      if (!a.id && b.id) return 1
+      return a.idx - b.idx
+    }).map((entry) => entry.row)
+  }
+
+  return [...timed.map((entry) => entry.row), ...noTimeSorted]
 }
 
 function diffDays(a, b) {
@@ -523,17 +669,22 @@ function inferLegacyRepeatMetaForItem(items, item) {
 
   const baseCategory = String(item?.category_id ?? "__general__").trim() || "__general__"
   const baseContent = String(item?.content ?? "").trim()
-  const baseTime = String(item?.time ?? "").trim()
+  const baseTimeRange = normalizePlanTimeRange(item)
+  const baseTime = baseTimeRange.time
+  const baseEndTime = baseTimeRange.endTime
   const baseKey = dateKeyFromDate(baseDate)
 
   const matched = (items ?? []).filter((row) => {
     if (!row) return false
     const rowCategory = String(row?.category_id ?? "__general__").trim() || "__general__"
     const rowContent = String(row?.content ?? "").trim()
-    const rowTime = String(row?.time ?? "").trim()
+    const rowTimeRange = normalizePlanTimeRange(row)
+    const rowTime = rowTimeRange.time
+    const rowEndTime = rowTimeRange.endTime
     if (rowCategory !== baseCategory) return false
     if (rowContent !== baseContent) return false
     if (rowTime !== baseTime) return false
+    if (rowEndTime !== baseEndTime) return false
     return Boolean(parseDateKey(String(row?.date ?? "")))
   })
 
@@ -616,6 +767,7 @@ function inferLegacyRepeatMetaForItem(items, item) {
 function buildPlanEditorSnapshot({
   date = "",
   time = "",
+  endTime = "",
   content = "",
   category = "__general__",
   alarmEnabled = true,
@@ -628,11 +780,14 @@ function buildPlanEditorSnapshot({
   const normalizedRepeatType = normalizeRepeatType(repeatType)
   const normalizedRepeatInterval =
     normalizedRepeatType === "none" ? 1 : normalizeRepeatInterval(repeatInterval)
-  const normalizedTime = String(time ?? "").trim()
+  const normalizedTime = normalizeClockTime(time)
+  let normalizedEndTime = normalizeClockTime(endTime)
+  if (!normalizedTime || !normalizedEndTime || normalizedEndTime === normalizedTime) normalizedEndTime = ""
   const normalizedAlarmEnabled = Boolean(normalizedTime) ? Boolean(alarmEnabled) : false
   return {
     date: String(date ?? ""),
     time: normalizedTime,
+    endTime: normalizedEndTime,
     content: String(content ?? "").trim(),
     category: String(category ?? "__general__") || "__general__",
     alarmEnabled: normalizedAlarmEnabled,
@@ -894,6 +1049,7 @@ function WindowTabs({
   onRenameWindow,
   onDeleteWindow,
   onChangeWindowColor,
+  onReorderWindows,
   tone = "light"
 }) {
   const isDark = tone === "dark"
@@ -932,6 +1088,29 @@ function WindowTabs({
     const available = palette.find((c) => !used.has(String(c).toLowerCase()))
     return available ?? palette[(windows?.length ?? 1) % palette.length] ?? palette[0]
   }, [palette, windows])
+
+  const tabs = useMemo(() => windows ?? [], [windows])
+  const fixedTabs = useMemo(() => tabs.filter((w) => Boolean(w?.fixed)), [tabs])
+  const movableTabs = useMemo(() => tabs.filter((w) => !w?.fixed), [tabs])
+  const tabsScrollRef = useRef(null)
+  const tabLayoutsRef = useRef({})
+  const tabDragOrderRef = useRef(movableTabs)
+  const dragStateRef = useRef({ activeId: null, startX: 0, width: 0, currentIndex: -1, lastSwapAt: 0 })
+  const dragX = useRef(new Animated.Value(0)).current
+  const [tabDragOrder, setTabDragOrder] = useState(movableTabs)
+  const [draggingTabId, setDraggingTabId] = useState(null)
+
+  useEffect(() => {
+    if (Platform.OS !== "android") return
+    if (typeof UIManager?.setLayoutAnimationEnabledExperimental !== "function") return
+    UIManager.setLayoutAnimationEnabledExperimental(true)
+  }, [])
+
+  useEffect(() => {
+    if (draggingTabId) return
+    setTabDragOrder(movableTabs)
+    tabDragOrderRef.current = movableTabs
+  }, [movableTabs, draggingTabId])
 
   function closeAll() {
     setMenuVisible(false)
@@ -1008,63 +1187,256 @@ function WindowTabs({
     ])
   }
 
+  function moveItem(list, fromIndex, toIndex) {
+    const next = Array.isArray(list) ? [...list] : []
+    if (fromIndex === toIndex) return next
+    if (fromIndex < 0 || toIndex < 0) return next
+    if (fromIndex >= next.length || toIndex >= next.length) return next
+    const [moved] = next.splice(fromIndex, 1)
+    next.splice(toIndex, 0, moved)
+    return next
+  }
+
+  function idsEqual(a, b) {
+    const left = Array.isArray(a) ? a : []
+    const right = Array.isArray(b) ? b : []
+    if (left.length !== right.length) return false
+    for (let i = 0; i < left.length; i += 1) {
+      if (String(left[i] ?? "") !== String(right[i] ?? "")) return false
+    }
+    return true
+  }
+
+  function getTabMidpoint(id) {
+    const key = String(id ?? "")
+    if (!key) return null
+    const layout = tabLayoutsRef.current?.[key]
+    if (!layout) return null
+    const x = Number(layout.x ?? 0)
+    const width = Number(layout.width ?? 0)
+    if (!Number.isFinite(x) || !Number.isFinite(width) || width <= 0) return null
+    return x + width / 2
+  }
+
+  function startTabDrag(windowItem) {
+    if (!onReorderWindows) return
+    if (!windowItem || windowItem?.fixed) return
+    const id = String(windowItem?.id ?? "").trim()
+    if (!id) return
+    const layout = tabLayoutsRef.current?.[id]
+    if (!layout) return
+    const initial = movableTabs
+    const initialIndex = initial.findIndex((w) => String(w?.id ?? "") === id)
+    if (initialIndex < 0) return
+    dragStateRef.current = {
+      activeId: id,
+      startX: Number(layout.x ?? 0),
+      width: Math.max(1, Number(layout.width ?? 0)),
+      currentIndex: initialIndex,
+      lastSwapAt: 0
+    }
+    dragX.setValue(Number(layout.x ?? 0))
+    setTabDragOrder(initial)
+    tabDragOrderRef.current = initial
+    setDraggingTabId(id)
+  }
+
+  function finishTabDrag() {
+    const state = dragStateRef.current
+    if (!state.activeId) return
+    const activeId = String(state.activeId ?? "")
+    const orderedMovable = Array.isArray(tabDragOrderRef.current) ? tabDragOrderRef.current : []
+    const orderedIds = orderedMovable.map((w) => String(w?.id ?? "")).filter(Boolean)
+    const prevIds = movableTabs.map((w) => String(w?.id ?? "")).filter(Boolean)
+    const cleanup = () => {
+      dragStateRef.current = { activeId: null, startX: 0, width: 0, currentIndex: -1, lastSwapAt: 0 }
+      setDraggingTabId(null)
+    }
+
+    dragX.stopAnimation((currentX) => {
+      const rawTarget = Number(tabLayoutsRef.current?.[activeId]?.x ?? Number.NaN)
+      const fallback = Number.isFinite(currentX) ? currentX : Number(state.startX ?? 0)
+      const targetX = Number.isFinite(rawTarget) ? rawTarget : fallback
+      Animated.timing(dragX, {
+        toValue: targetX,
+        duration: 110,
+        useNativeDriver: false
+      }).start(() => {
+        cleanup()
+      })
+    })
+
+    if (onReorderWindows && orderedIds.length > 0 && !idsEqual(orderedIds, prevIds)) {
+      onReorderWindows(orderedMovable)
+    }
+  }
+
+  const tabPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => Boolean(dragStateRef.current.activeId),
+        onStartShouldSetPanResponderCapture: () => Boolean(dragStateRef.current.activeId),
+        onMoveShouldSetPanResponder: () => Boolean(dragStateRef.current.activeId),
+        onMoveShouldSetPanResponderCapture: () => Boolean(dragStateRef.current.activeId),
+        onPanResponderMove: (_evt, gesture) => {
+          const state = dragStateRef.current
+          if (!state.activeId) return
+          const nextX = Number(state.startX ?? 0) + Number(gesture?.dx ?? 0)
+          dragX.setValue(nextX)
+          const list = tabDragOrderRef.current
+          if (!Array.isArray(list) || list.length === 0) return
+          const now = Date.now()
+          if (now - Number(state.lastSwapAt ?? 0) < 70) return
+          const centerX = nextX + Number(state.width ?? 0) / 2
+          const deadZone = Math.max(10, Math.min(22, Number(state.width ?? 0) * 0.15))
+          let currentIndex = Number(state.currentIndex ?? -1)
+          if (!Number.isFinite(currentIndex) || currentIndex < 0 || currentIndex >= list.length) {
+            currentIndex = list.findIndex((w) => String(w?.id ?? "") === state.activeId)
+          }
+          if (currentIndex < 0) return
+          let targetIndex = currentIndex
+
+          while (targetIndex < list.length - 1) {
+            const rightId = String(list[targetIndex + 1]?.id ?? "")
+            const rightMid = getTabMidpoint(rightId)
+            if (!Number.isFinite(rightMid)) break
+            if (centerX > rightMid + deadZone) targetIndex += 1
+            else break
+          }
+
+          while (targetIndex > 0) {
+            const leftId = String(list[targetIndex - 1]?.id ?? "")
+            const leftMid = getTabMidpoint(leftId)
+            if (!Number.isFinite(leftMid)) break
+            if (centerX < leftMid - deadZone) targetIndex -= 1
+            else break
+          }
+
+          if (targetIndex === currentIndex) return
+          if (typeof LayoutAnimation?.configureNext === "function") {
+            LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut)
+          }
+          const nextOrder = moveItem(list, currentIndex, targetIndex)
+          tabDragOrderRef.current = nextOrder
+          dragStateRef.current = { ...state, currentIndex: targetIndex, lastSwapAt: now }
+          setTabDragOrder(nextOrder)
+        },
+        onPanResponderRelease: () => finishTabDrag(),
+        onPanResponderTerminate: () => finishTabDrag(),
+        onPanResponderTerminationRequest: () => false
+      }),
+    [movableTabs, onReorderWindows]
+  )
+
+  function renderTabPill(windowItem, options = {}) {
+    if (!windowItem) return null
+    const { ghost = false, placeholder = false, onLayout, onLongPress } = options
+    const active = windowItem.id === activeId
+    const isAll = windowItem.id === "all"
+    const label = String(windowItem.title ?? (isAll ? "통합" : ""))
+    const pillStyle = [
+      styles.tabPill,
+      isAll ? styles.tabPillAll : null,
+      isDark ? styles.tabPillDark : null,
+      active ? (isDark ? styles.tabPillActiveDark : styles.tabPillActive) : null,
+      ghost ? styles.tabPillGhost : null,
+      ghost && isDark ? styles.tabPillGhostDark : null,
+      placeholder ? styles.tabPillPlaceholder : null
+    ]
+    const labelStyle = [
+      styles.tabText,
+      isAll ? styles.tabTextAll : null,
+      isDark ? styles.tabTextDark : null,
+      active ? (isDark ? styles.tabTextActiveDark : styles.tabTextActive) : null
+    ]
+    const content = (
+      <>
+        {!isAll ? (
+          <View style={[styles.tabDot, { backgroundColor: windowItem.color || "#3b82f6" }]} />
+        ) : null}
+        <Text style={labelStyle} numberOfLines={1}>
+          {label}
+        </Text>
+        {!isAll ? (
+          <Pressable
+            onPress={(e) => {
+              e?.stopPropagation?.()
+              openMenu(windowItem)
+            }}
+            onLongPress={(e) => {
+              e?.stopPropagation?.()
+            }}
+            hitSlop={10}
+            style={styles.tabMenuBtn}
+          >
+            <Text style={styles.tabMenuIcon}>{"\u22EE"}</Text>
+          </Pressable>
+        ) : null}
+      </>
+    )
+    if (ghost) {
+      return (
+        <View style={pillStyle}>
+          {content}
+        </View>
+      )
+    }
+    return (
+      <TouchableOpacity
+        key={windowItem.id}
+        onLayout={onLayout}
+        style={pillStyle}
+        onPress={() => {
+          if (draggingTabId) return
+          onSelect(windowItem.id)
+        }}
+        onLongPress={!isAll ? onLongPress : undefined}
+        delayLongPress={160}
+        activeOpacity={0.9}
+      >
+        {content}
+      </TouchableOpacity>
+    )
+  }
+
+  const orderedMovableTabs = draggingTabId ? tabDragOrder : movableTabs
+  const displayTabs = [...fixedTabs, ...orderedMovableTabs]
+  const draggingTab =
+    draggingTabId ? displayTabs.find((w) => String(w?.id ?? "") === String(draggingTabId ?? "")) ?? null : null
+
   return (
     <View style={[styles.tabBarWrap, isDark ? styles.tabBarWrapDark : null]}>
       <View style={styles.tabBarInner}>
         <ScrollView
+          ref={tabsScrollRef}
           horizontal
+          scrollEnabled={!draggingTabId}
           showsHorizontalScrollIndicator={false}
           style={[styles.tabScroll, isDark ? styles.tabScrollDark : null]}
-          contentContainerStyle={[
-            styles.tabRow,
-            isDark ? styles.tabRowDark : null,
-            { paddingRight: 40 }
-          ]}
+          contentContainerStyle={{ paddingRight: 40 }}
         >
-          {windows.map((w) => {
-            const active = w.id === activeId
-            const label = w.id === "all" ? "통합" : w.title
-            return (
-              <TouchableOpacity
-                key={w.id}
-                style={[
-                  styles.tabPill,
-                  w.id === "all" ? styles.tabPillAll : null,
-                  isDark ? styles.tabPillDark : null,
-                  active ? (isDark ? styles.tabPillActiveDark : styles.tabPillActive) : null
-                ]}
-                onPress={() => onSelect(w.id)}
-                activeOpacity={0.9}
-              >
-                {w.id !== "all" ? (
-                  <View style={[styles.tabDot, { backgroundColor: w.color || "#3b82f6" }]} />
-                ) : null}
-                <Text
-                  style={[
-                    styles.tabText,
-                    w.id === "all" ? styles.tabTextAll : null,
-                    isDark ? styles.tabTextDark : null,
-                    active ? (isDark ? styles.tabTextActiveDark : styles.tabTextActive) : null
-                  ]}
-                  numberOfLines={1}
-                >
-                  {label}
-                </Text>
-                {w.id !== "all" ? (
-                  <Pressable
-                    onPress={(e) => {
-                      e?.stopPropagation?.()
-                      openMenu(w)
-                    }}
-                    hitSlop={10}
-                    style={styles.tabMenuBtn}
-                  >
-                    <Text style={styles.tabMenuIcon}>⋮</Text>
-                  </Pressable>
-                ) : null}
-              </TouchableOpacity>
-            )
-          })}
+          <View style={[styles.tabRow, isDark ? styles.tabRowDark : null]} {...tabPanResponder.panHandlers}>
+            {displayTabs.map((w) => {
+              const id = String(w?.id ?? "")
+              const placeholder = Boolean(draggingTabId && id === String(draggingTabId))
+              return renderTabPill(w, {
+                placeholder,
+                onLayout: (e) => {
+                  tabLayoutsRef.current[id] = e?.nativeEvent?.layout ?? null
+                },
+                onLongPress: !w?.fixed
+                  ? () => {
+                      startTabDrag(w)
+                    }
+                  : undefined
+              })
+            })}
+            {draggingTab ? (
+              <Animated.View pointerEvents="none" style={[styles.tabDragOverlay, { transform: [{ translateX: dragX }] }]}>
+                {renderTabPill(draggingTab, { ghost: true })}
+              </Animated.View>
+            ) : null}
+          </View>
         </ScrollView>
 
         <View pointerEvents="none" style={[styles.tabAddMask, isDark ? styles.tabAddMaskDark : null]} />
@@ -1232,6 +1604,7 @@ function WindowTabs({
 
 function ListScreen({
   sections,
+  allItemsByDate,
   loading,
   onRefresh,
   onSignOut,
@@ -1244,16 +1617,20 @@ function ListScreen({
   onRenameWindow,
   onDeleteWindow,
   onChangeWindowColor,
+  onReorderWindows,
   holidaysByDate,
   ensureHolidayYear,
   onAddPlan,
-  onEditPlan
+  onEditPlan,
+  onReorderNoTime
 }) {
   const scale = useMemo(() => {
     const n = Number(fontScale)
     if (!Number.isFinite(n)) return 1
     return Math.max(0.85, Math.min(1.25, n))
   }, [fontScale])
+  const memoFontSize = Math.round(14 * scale)
+  const memoLineHeight = Math.round(20 * scale)
   const fs = useCallback((n) => Math.round(n * scale), [scale])
   const isDark = tone === "dark"
   const today = new Date()
@@ -1275,6 +1652,17 @@ function ListScreen({
   const [listFilterVisible, setListFilterVisible] = useState(false)
   const [listFilterTitles, setListFilterTitles] = useState([])
   const listFilterInitRef = useRef(false)
+  const [reorderState, setReorderState] = useState({ visible: false, dateKey: "" })
+  const [reorderItems, setReorderItems] = useState([])
+  const reorderItemsRef = useRef([])
+  const reorderOriginalIdsRef = useRef([])
+  const [reorderSaving, setReorderSaving] = useState(false)
+  const [draggingId, setDraggingId] = useState(null)
+  const dragY = useRef(new Animated.Value(0)).current
+  const noTimeLayoutsRef = useRef({})
+  const dragStateRef = useRef({ activeId: null, startY: 0, height: 0, currentIndex: -1, lastSwapAt: 0 })
+  const pendingAutoDragIdRef = useRef("")
+  const suppressPressRef = useRef(false)
 
   const colorByTitle = useMemo(() => {
     const map = new Map()
@@ -1308,6 +1696,222 @@ function ListScreen({
     [activeTabId, listFilterTitles]
   )
 
+  useEffect(() => {
+    reorderItemsRef.current = reorderItems
+  }, [reorderItems])
+
+  const getAllItemsForDate = useCallback(
+    (dateKey) => {
+      const key = String(dateKey ?? "").trim()
+      if (!key) return []
+      if (allItemsByDate && typeof allItemsByDate.get === "function") {
+        return allItemsByDate.get(key) ?? []
+      }
+      const section = (sections ?? []).find((s) => String(s?.title ?? "") === key)
+      return Array.isArray(section?.data) ? section.data : []
+    },
+    [allItemsByDate, sections]
+  )
+
+  const hasTimeText = useCallback((item) => Boolean(normalizePlanTimeRange(item).time), [])
+  function moveItem(list, fromIndex, toIndex) {
+    const safe = Array.isArray(list) ? list : []
+    const next = [...safe]
+    if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return next
+    if (fromIndex >= next.length || toIndex >= next.length) return next
+    const [moved] = next.splice(fromIndex, 1)
+    next.splice(toIndex, 0, moved)
+    return next
+  }
+
+  function idsEqual(a, b) {
+    const left = Array.isArray(a) ? a : []
+    const right = Array.isArray(b) ? b : []
+    if (left.length != right.length) return false
+    for (let i = 0; i < left.length; i += 1) {
+      if (left[i] != right[i]) return false
+    }
+    return true
+  }
+
+  function openReorderModal(dateKey) {
+    if (!onReorderNoTime) return
+    const key = String(dateKey ?? "").trim()
+    if (!key) return
+    const items = getAllItemsForDate(key)
+    const noTimeItems = items.filter((item) => !hasTimeText(item))
+    setReorderState({ visible: true, dateKey: key })
+    setReorderItems(noTimeItems)
+    reorderItemsRef.current = noTimeItems
+    reorderOriginalIdsRef.current = noTimeItems
+      .map((item) => String(item?.id ?? "").trim())
+      .filter(Boolean)
+    noTimeLayoutsRef.current = {}
+    dragStateRef.current = { activeId: null, startY: 0, height: 0, currentIndex: -1, lastSwapAt: 0 }
+    setDraggingId(null)
+    setReorderSaving(false)
+    dragY.setValue(0)
+  }
+
+  function closeReorderModal() {
+    setReorderState({ visible: false, dateKey: "" })
+    setReorderItems([])
+    reorderItemsRef.current = []
+    reorderOriginalIdsRef.current = []
+    noTimeLayoutsRef.current = {}
+    dragStateRef.current = { activeId: null, startY: 0, height: 0, currentIndex: -1, lastSwapAt: 0 }
+    pendingAutoDragIdRef.current = ""
+    setDraggingId(null)
+    setReorderSaving(false)
+    suppressPressRef.current = false
+    dragY.setValue(0)
+  }
+
+  function startDrag(item) {
+    if (!item) return
+    const id = String(item?.id ?? "").trim()
+    if (!id) return
+    const layout = noTimeLayoutsRef.current?.[id]
+    if (!layout) return
+    const list = reorderItemsRef.current
+    const currentIndex = Array.isArray(list) ? list.findIndex((row) => String(row?.id ?? "").trim() === id) : -1
+    if (currentIndex < 0) return
+    const startY = Number(layout.y) || 0
+    const height = Number(layout.height) || 48
+    dragStateRef.current = { activeId: id, startY, height, currentIndex, lastSwapAt: 0 }
+    dragY.setValue(startY)
+    requestAnimationFrame(() => {
+      setDraggingId(id)
+    })
+  }
+
+  function finishDrag() {
+    const state = dragStateRef.current
+    if (!state.activeId) return
+    const activeId = String(state.activeId ?? "")
+    const cleanup = () => {
+      dragStateRef.current = { activeId: null, startY: 0, height: 0, currentIndex: -1, lastSwapAt: 0 }
+      setDraggingId(null)
+      requestAnimationFrame(() => {
+        dragY.setValue(0)
+      })
+    }
+
+    dragY.stopAnimation((currentY) => {
+      const rawTarget = Number(noTimeLayoutsRef.current?.[activeId]?.y ?? Number.NaN)
+      const fallback = Number.isFinite(currentY) ? currentY : Number(state.startY ?? 0)
+      const targetY = Number.isFinite(rawTarget) ? rawTarget : fallback
+      Animated.timing(dragY, {
+        toValue: targetY,
+        duration: 90,
+        useNativeDriver: false
+      }).start(() => cleanup())
+    })
+  }
+
+  function getReorderRowMidpoint(id) {
+    const key = String(id ?? "").trim()
+    if (!key) return null
+    const layout = noTimeLayoutsRef.current?.[key]
+    if (!layout) return null
+    const y = Number(layout.y ?? 0)
+    const height = Number(layout.height ?? 0)
+    if (!Number.isFinite(y) || !Number.isFinite(height) || height <= 0) return null
+    return y + height / 2
+  }
+
+  const panResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => Boolean(dragStateRef.current.activeId),
+        onStartShouldSetPanResponderCapture: () => Boolean(dragStateRef.current.activeId),
+        onMoveShouldSetPanResponder: () => Boolean(dragStateRef.current.activeId),
+        onMoveShouldSetPanResponderCapture: () => Boolean(dragStateRef.current.activeId),
+        onPanResponderMove: (_evt, gesture) => {
+          const state = dragStateRef.current
+          if (!state.activeId) return
+          const nextY = Number(state.startY ?? 0) + Number(gesture?.dy ?? 0)
+          dragY.setValue(nextY)
+          const list = reorderItemsRef.current
+          if (!Array.isArray(list) || list.length === 0) return
+          let currentIndex = Number(state.currentIndex ?? -1)
+          if (!Number.isFinite(currentIndex) || currentIndex < 0 || currentIndex >= list.length) {
+            currentIndex = list.findIndex((row) => String(row?.id ?? "") === String(state.activeId ?? ""))
+          }
+          if (currentIndex < 0) return
+          const now = Date.now()
+          if (now - Number(state.lastSwapAt ?? 0) < 60) return
+          const centerY = nextY + Number(state.height ?? 0) / 2
+          const deadZone = Math.max(8, Math.min(18, Number(state.height ?? 0) * 0.15))
+          let targetIndex = currentIndex
+
+          while (targetIndex < list.length - 1) {
+            const rightId = String(list[targetIndex + 1]?.id ?? "")
+            const rightMid = getReorderRowMidpoint(rightId)
+            if (!Number.isFinite(rightMid)) break
+            if (centerY > rightMid + deadZone) targetIndex += 1
+            else break
+          }
+
+          while (targetIndex > 0) {
+            const leftId = String(list[targetIndex - 1]?.id ?? "")
+            const leftMid = getReorderRowMidpoint(leftId)
+            if (!Number.isFinite(leftMid)) break
+            if (centerY < leftMid - deadZone) targetIndex -= 1
+            else break
+          }
+
+          if (targetIndex === currentIndex) return
+          const nextItems = moveItem(list, currentIndex, targetIndex)
+          if (Platform.OS !== "web") {
+            LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut)
+          }
+          reorderItemsRef.current = nextItems
+          dragStateRef.current = { ...state, currentIndex: targetIndex, lastSwapAt: now }
+          setReorderItems(nextItems)
+        },
+        onPanResponderRelease: () => finishDrag(),
+        onPanResponderTerminate: () => finishDrag(),
+        onPanResponderTerminationRequest: () => false
+      }),
+    []
+  )
+
+  useEffect(() => {
+    if (!reorderState.visible) return
+    const pendingId = String(pendingAutoDragIdRef.current ?? "").trim()
+    if (!pendingId) return
+    const row = reorderItems.find((item) => String(item?.id ?? "").trim() === pendingId)
+    if (!row) {
+      pendingAutoDragIdRef.current = ""
+      return
+    }
+    if (!noTimeLayoutsRef.current?.[pendingId]) return
+    pendingAutoDragIdRef.current = ""
+    startDrag(row)
+  }, [reorderState.visible, reorderItems])
+
+  async function commitReorder() {
+    if (reorderSaving) return
+    const dateKey = String(reorderState?.dateKey ?? "").trim()
+    const list = Array.isArray(reorderItemsRef.current) ? reorderItemsRef.current : []
+    const nextIds = list.map((item) => String(item?.id ?? "").trim()).filter(Boolean)
+    if (!dateKey || nextIds.length === 0) {
+      closeReorderModal()
+      return
+    }
+    if (idsEqual(nextIds, reorderOriginalIdsRef.current)) {
+      closeReorderModal()
+      return
+    }
+    setReorderSaving(true)
+    try {
+      await onReorderNoTime?.(dateKey, list)
+    } finally {
+      closeReorderModal()
+    }
+  }
+
   function scrollToToday() {
     const index = visibleSections.findIndex((s) => s.title === todayKey)
     if (index === -1) return false
@@ -1339,6 +1943,28 @@ function ListScreen({
       setViewMonth(nextMonth)
     }
   }
+
+  const listPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onMoveShouldSetPanResponder: (_evt, gesture) => {
+          if (draggingId) return false
+          const { dx, dy } = gesture
+          return Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.2
+        },
+        onPanResponderRelease: (_evt, gesture) => {
+          if (draggingId) return
+          const { dx, dy } = gesture
+          if (Math.abs(dx) < 40 || Math.abs(dx) <= Math.abs(dy)) return
+          if (dx > 0) {
+            goPrevMonth()
+          } else {
+            goNextMonth()
+          }
+        }
+      }),
+    [viewMonth, viewYear, draggingId]
+  )
 
   useEffect(() => {
     ensureHolidayYear?.(viewYear)
@@ -1386,14 +2012,92 @@ function ListScreen({
 
   const visibleSections = useMemo(() => {
     const prefix = `${viewYear}-${pad2(viewMonth)}-`
+    const activeKey = reorderState?.visible ? String(reorderState?.dateKey ?? "") : ""
     return (sections ?? [])
       .filter((section) => String(section.title ?? "").startsWith(prefix))
-      .map((section) => ({
-        ...section,
-        data: applyListFilter(section?.data ?? [])
-      }))
+      .map((section) => {
+        const key = String(section?.title ?? "")
+        const baseData = applyListFilter(section?.data ?? [])
+        if (activeKey && key === activeKey) {
+          const timedItems = baseData.filter((item) => hasTimeText(item))
+          return {
+            ...section,
+            data: [
+              ...timedItems,
+              { id: `__reorder__-${key}`, __reorder: true, date: key }
+            ]
+          }
+        }
+        return {
+          ...section,
+          data: baseData
+        }
+      })
       .filter((section) => (section?.data?.length ?? 0) > 0)
-  }, [sections, viewYear, viewMonth, applyListFilter])
+  }, [sections, viewYear, viewMonth, applyListFilter, reorderState, hasTimeText])
+
+  const reorderDow = reorderState.dateKey ? weekdayLabel(reorderState.dateKey) : ""
+  const reorderDateLabel = reorderState.dateKey
+    ? `${formatDateMD(reorderState.dateKey)}${reorderDow ? ` (${reorderDow})` : ""}`
+    : ""
+  const draggingItem = reorderItems.find((item) => String(item?.id ?? "") === draggingId)
+
+  function renderReorderRow(item, options = {}) {
+    if (!item) return null
+    const { draggable = false, ghost = false, placeholder = false, onLayout, onLongPress, rowKey } = options
+    const time = buildPlanTimeTextFromRow(item)
+    const content = String(item?.content ?? "").trim()
+    const category = String(item?.category_id ?? "").trim()
+    const isGeneral = !category || category === "__general__"
+    const categoryColor = colorByTitle.get(category) || "#94a3b8"
+    const Container = draggable && !ghost ? Pressable : View
+    return (
+      <Container
+        key={rowKey}
+        onLayout={onLayout}
+        onLongPress={draggable && !ghost ? onLongPress : undefined}
+        delayLongPress={draggable && !ghost ? 180 : undefined}
+        style={[
+          styles.reorderItemRow,
+          isDark ? styles.reorderItemRowDark : null,
+          ghost ? styles.reorderDragGhost : null,
+          ghost && isDark ? styles.reorderDragGhostDark : null,
+          placeholder ? styles.reorderItemPlaceholder : null
+        ]}
+      >
+        <View style={styles.itemLeftCol}>
+          <Text
+            style={
+              time
+                ? [styles.itemTimeText, { fontSize: fs(12) }, isDark ? styles.itemTimeTextDark : null]
+                : [styles.itemTimeTextEmpty, { fontSize: fs(12) }]
+            }
+          >
+            {time || " "}
+          </Text>
+        </View>
+        <View style={styles.itemMainCol}>
+          <View style={styles.itemTopRow}>
+            <Text
+              style={[styles.itemTitle, { fontSize: fs(14) }, isDark ? styles.textDark : null]}
+              numberOfLines={2}
+              ellipsizeMode="tail"
+            >
+              {content}
+            </Text>
+            {!isGeneral ? (
+              <View style={[styles.itemCategoryBadge, isDark ? styles.badgeDark : null]}>
+                <View style={[styles.itemCategoryDot, { backgroundColor: categoryColor }]} />
+                <Text style={[styles.itemCategoryText, isDark ? styles.textMutedDark : null]} numberOfLines={1}>
+                  {category}
+                </Text>
+              </View>
+            ) : null}
+          </View>
+        </View>
+      </Container>
+    )
+  }
 
   useEffect(() => {
     if (!pendingScrollRef.current) return
@@ -1431,16 +2135,17 @@ function ListScreen({
         onRenameWindow={onRenameWindow}
         onDeleteWindow={onDeleteWindow}
         onChangeWindowColor={onChangeWindowColor}
+        onReorderWindows={onReorderWindows}
         tone={tone}
       />
       <View style={[styles.listMonthBar, isDark ? styles.listMonthBarDark : null]}>
         <View style={styles.listMonthLeftGroup}>
           <TouchableOpacity style={styles.listMonthNavButton} onPress={goPrevMonth}>
-            <Text style={[styles.listMonthNavText, isDark ? styles.textDark : null]}>{"‹"}</Text>
+            <Text style={[styles.listMonthNavText, isDark ? styles.textDark : null]}>{"<"}</Text>
           </TouchableOpacity>
           <Text style={[styles.listMonthText, isDark ? styles.textDark : null]}>{monthLabel}</Text>
           <TouchableOpacity style={styles.listMonthNavButton} onPress={goNextMonth}>
-            <Text style={[styles.listMonthNavText, isDark ? styles.textDark : null]}>{"›"}</Text>
+            <Text style={[styles.listMonthNavText, isDark ? styles.textDark : null]}>{">"}</Text>
           </TouchableOpacity>
         </View>
         <View style={styles.listMonthRightGroup}>
@@ -1452,39 +2157,131 @@ function ListScreen({
           </TouchableOpacity>
         </View>
       </View>
-      <View style={[styles.card, styles.listCard, isDark ? styles.cardDark : null, isDark ? styles.listCardDark : null]}>
+      <View
+        style={[styles.card, styles.listCard, isDark ? styles.cardDark : null, isDark ? styles.listCardDark : null]}
+        {...listPanResponder.panHandlers}
+      >
         {loading ? <ActivityIndicator size="small" color="#3b82f6" /> : null}
         <SectionList
           ref={listRef}
           sections={visibleSections}
           keyExtractor={(item) => item.id ?? `${item.date}-${item.content}`}
           stickySectionHeadersEnabled={false}
-	          renderItem={({ item }) => {
-	            const time = item?.time ? String(item.time).trim() : ""
-	            const content = String(item?.content ?? "").trim()
-	            const category = String(item?.category_id ?? "").trim()
-	            const isGeneral = !category || category === "__general__"
-	            const categoryColor = colorByTitle.get(category) || "#94a3b8"
-	            return (
-	              <Pressable style={[styles.itemRow, isDark ? styles.itemRowDark : null]} onPress={() => onEditPlan?.(item)}>
-	                <View style={styles.itemLeftCol}>
-	                  <Text
-	                    style={
-	                      time
-	                        ? [styles.itemTimeText, { fontSize: fs(12) }, isDark ? styles.itemTimeTextDark : null]
-	                        : [styles.itemTimeTextEmpty, { fontSize: fs(12) }]
-	                    }
-	                  >
-	                    {time || " "}
-	                  </Text>
-	                </View>
-	                <View style={styles.itemMainCol}>
-	                  <View style={styles.itemTopRow}>
-	                    <Text
-                        style={[styles.itemTitle, { fontSize: fs(14) }, isDark ? styles.textDark : null]}
-                        numberOfLines={2}
-                        ellipsizeMode="tail"
+          scrollEnabled={!draggingId}
+          renderItem={({ item, section }) => {
+            if (item?.__reorder) {
+              return (
+                <View style={[styles.reorderInlineCard, isDark ? styles.reorderInlineCardDark : null]}>
+                  <View style={styles.reorderInlineHeader}>
+                    <View>
+                      {reorderDateLabel ? (
+                        <Text style={[styles.reorderInlineTitle, isDark ? styles.textDark : null]}>
+                          {reorderDateLabel}
+                        </Text>
+                      ) : null}
+                    </View>
+                    <View style={styles.reorderHeaderActions}>
+                      <Pressable
+                        onPress={closeReorderModal}
+                        style={[styles.reorderHeaderBtn, isDark ? styles.reorderHeaderBtnDark : null]}
+                        disabled={reorderSaving}
                       >
+                        <Text style={[styles.reorderHeaderBtnText, isDark ? styles.textMutedDark : null]}>취소</Text>
+                      </Pressable>
+                      <Pressable
+                        onPress={commitReorder}
+                        style={[styles.reorderHeaderBtn, styles.reorderHeaderBtnPrimary]}
+                        disabled={reorderSaving}
+                      >
+                        <Text style={styles.reorderHeaderBtnPrimaryText}>
+                          {reorderSaving ? "저장 중..." : "저장"}
+                        </Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                  <Text style={[styles.reorderInlineHint, isDark ? styles.textMutedDark : null]}>
+                    항목을 길게 눌러 드래그
+                  </Text>
+                  <View style={styles.reorderNoTimeList} {...panResponder.panHandlers}>
+                    {reorderItems.length ? (
+                      reorderItems.map((row) => {
+                        const rowId = String(row?.id ?? "")
+                        const rowKey = rowId || `${row?.date}-${row?.content}`
+                        const isPlaceholder = rowId && rowId === draggingId
+                        return renderReorderRow(row, {
+                          rowKey,
+                          draggable: true,
+                          placeholder: isPlaceholder,
+                          onLayout: (event) => {
+                            if (!rowId) return
+                            const layout = event?.nativeEvent?.layout
+                            if (!layout) return
+                            noTimeLayoutsRef.current[rowId] = { y: layout.y, height: layout.height }
+                          },
+                          onLongPress: () => startDrag(row)
+                        })
+                      })
+                    ) : (
+                      <View style={styles.reorderEmpty}>
+                        <Text style={[styles.reorderEmptyText, isDark ? styles.textMutedDark : null]}>
+                          시간 없는 일정이 없습니다.
+                        </Text>
+                      </View>
+                    )}
+                    {draggingItem ? (
+                      <Animated.View pointerEvents="none" style={[styles.reorderDragOverlay, { top: dragY }]}>
+                        {renderReorderRow(draggingItem, { ghost: true })}
+                      </Animated.View>
+                    ) : null}
+                  </View>
+                </View>
+              )
+            }
+            const time = buildPlanTimeTextFromRow(item)
+            const content = String(item?.content ?? "").trim()
+            const category = String(item?.category_id ?? "").trim()
+            const isGeneral = !category || category === "__general__"
+            const categoryColor = colorByTitle.get(category) || "#94a3b8"
+            const dateKey = String(section?.title ?? item?.date ?? "")
+            const canReorder = !time && Boolean(onReorderNoTime)
+            const handlePress = () => {
+              if (suppressPressRef.current) {
+                suppressPressRef.current = false
+                return
+              }
+              onEditPlan?.(item)
+            }
+            const handleLongPress = () => {
+              if (!canReorder) return
+              suppressPressRef.current = true
+              pendingAutoDragIdRef.current = String(item?.id ?? "").trim()
+              openReorderModal(dateKey)
+            }
+            return (
+              <Pressable
+                style={[styles.itemRow, isDark ? styles.itemRowDark : null]}
+                onPress={handlePress}
+                onLongPress={canReorder ? handleLongPress : undefined}
+                delayLongPress={220}
+              >
+                <View style={styles.itemLeftCol}>
+                  <Text
+                    style={
+                      time
+                        ? [styles.itemTimeText, { fontSize: fs(12) }, isDark ? styles.itemTimeTextDark : null]
+                        : [styles.itemTimeTextEmpty, { fontSize: fs(12) }]
+                    }
+                  >
+                    {time || " "}
+                  </Text>
+                </View>
+                <View style={styles.itemMainCol}>
+                  <View style={styles.itemTopRow}>
+                    <Text
+                      style={[styles.itemTitle, { fontSize: fs(14) }, isDark ? styles.textDark : null]}
+                      numberOfLines={2}
+                      ellipsizeMode="tail"
+                    >
                       {content}
                     </Text>
                     {!isGeneral ? (
@@ -1500,7 +2297,7 @@ function ListScreen({
               </Pressable>
             )
           }}
-	          renderSectionHeader={({ section }) => {
+          renderSectionHeader={({ section }) => {
 	            const key = String(section.title ?? "")
               const isTodaySection = key === todayKey
 	            const holidayName = holidaysByDate?.get?.(key) ?? ""
@@ -1652,6 +2449,7 @@ function MemoScreen({
   onRenameWindow,
   onDeleteWindow,
   onChangeWindowColor,
+  onReorderWindows,
   onSaveMemo
 }) {
   const isDark = tone === "dark"
@@ -1660,6 +2458,8 @@ function MemoScreen({
     if (!Number.isFinite(n)) return 1
     return Math.max(0.85, Math.min(1.25, n))
   }, [fontScale])
+  const memoFontSize = Math.round(14 * scale)
+  const memoLineHeight = Math.round(20 * scale)
   const [draft, setDraft] = useState("")
   const [dirty, setDirty] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
@@ -1667,16 +2467,22 @@ function MemoScreen({
   const [memoExpandedMap, setMemoExpandedMap] = useState({})
   const [memoEditingId, setMemoEditingId] = useState(null)
   const [memoEditDrafts, setMemoEditDrafts] = useState({})
+  const [memoFilterVisible, setMemoFilterVisible] = useState(false)
+  const [memoFilterTitles, setMemoFilterTitles] = useState([])
   const draftRef = useRef("")
   const dirtyRef = useRef(false)
   const inputRef = useRef(null)
   const memoInputRefs = useRef({})
   const memoAllScrollRef = useRef(null)
-  const memoAllScrollYRef = useRef(0)
-  const memoAllViewportHeightRef = useRef(0)
-  const memoAllViewportBaseHeightRef = useRef(0)
-  const memoAllCardLayoutsRef = useRef({})
   const memoSaveQueueRef = useRef({})
+  const memoEditDraftsRef = useRef(memoEditDrafts ?? {})
+  const rightMemosRef = useRef(rightMemos ?? {})
+  const activeTabIdRef = useRef(activeTabId)
+  const memoEditingIdRef = useRef(memoEditingId)
+  const isEditingRef = useRef(isEditing)
+  const autoSaveMemoEditRef = useRef(null)
+  const finishSingleEditRef = useRef(null)
+  const memoFilterInitRef = useRef(false)
   const prevTabRef = useRef(activeTabId)
   const lastAppliedTabRef = useRef(activeTabId)
   const saveTimerRef = useRef(null)
@@ -1701,7 +2507,8 @@ function MemoScreen({
 
   useEffect(() => {
     const showSub = Keyboard.addListener("keyboardDidShow", (e) => {
-      setKeyboardHeight(e?.endCoordinates?.height ?? 0)
+      const nextHeight = Math.max(0, Number(e?.endCoordinates?.height ?? 0))
+      setKeyboardHeight(nextHeight)
     })
     const hideSub = Keyboard.addListener("keyboardDidHide", () => {
       setKeyboardHeight(0)
@@ -1710,6 +2517,69 @@ function MemoScreen({
       showSub?.remove?.()
       hideSub?.remove?.()
     }
+  }, [])
+
+  useEffect(() => {
+    memoEditDraftsRef.current = memoEditDrafts ?? {}
+  }, [memoEditDrafts])
+
+  useEffect(() => {
+    rightMemosRef.current = rightMemos ?? {}
+  }, [rightMemos])
+
+
+  useEffect(() => {
+    activeTabIdRef.current = activeTabId
+  }, [activeTabId])
+
+  useEffect(() => {
+    memoEditingIdRef.current = memoEditingId
+  }, [memoEditingId])
+
+  useEffect(() => {
+    isEditingRef.current = isEditing
+  }, [isEditing])
+
+  useFocusEffect(
+    useCallback(() => {
+      return () => {
+        const prevId = String(activeTabIdRef.current ?? "")
+        if (prevId === "all") {
+          const editingKey = String(memoEditingIdRef.current ?? "")
+          if (editingKey) autoSaveMemoEditRef.current?.(editingKey)
+          setMemoEditingId(null)
+        } else {
+          if (dirtyRef.current || isEditingRef.current) {
+            finishSingleEditRef.current?.(prevId, false)
+          }
+          setIsEditing(false)
+        }
+        Keyboard.dismiss()
+      }
+    }, [])
+  )
+
+  useEffect(() => {
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      const currentTabId = String(activeTabIdRef.current ?? "")
+      if (currentTabId === "all") {
+        const editingKey = String(memoEditingIdRef.current ?? "")
+        if (editingKey) {
+          autoSaveMemoEditRef.current?.(editingKey)
+          setMemoEditingId(null)
+          Keyboard.dismiss()
+          return true
+        }
+        return false
+      }
+      if (isEditingRef.current) {
+        finishSingleEditRef.current?.(currentTabId, true)
+        Keyboard.dismiss()
+        return true
+      }
+      return false
+    })
+    return () => sub.remove()
   }, [])
 
   function queueMemoSave(tabId, text) {
@@ -1772,6 +2642,11 @@ function MemoScreen({
   }, [activeTabId, memoText])
 
   useEffect(() => {
+    if (activeTabId === "all") return
+    setMemoFilterVisible(false)
+  }, [activeTabId])
+
+  useEffect(() => {
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
       const prevId = prevTabRef.current
@@ -1791,6 +2666,48 @@ function MemoScreen({
     () => (windows ?? []).find((w) => String(w?.id ?? "") === String(activeTabId ?? "")) ?? null,
     [windows, activeTabId]
   )
+  const memoFilterOptions = useMemo(
+    () =>
+      (windows ?? [])
+        .filter((w) => w && w.id !== "all" && String(w.title ?? "").trim())
+        .map((w) => ({ title: String(w.title), color: w.color || "#94a3b8" })),
+    [windows]
+  )
+  const allMemoFilterTitles = useMemo(() => memoFilterOptions.map((opt) => opt.title), [memoFilterOptions])
+  const isAllMemoFiltersSelected =
+    allMemoFilterTitles.length === 0 || memoFilterTitles.length === allMemoFilterTitles.length
+
+  useEffect(() => {
+    if (!allMemoFilterTitles.length) {
+      setMemoFilterTitles([])
+      memoFilterInitRef.current = false
+      return
+    }
+    if (!memoFilterInitRef.current) {
+      setMemoFilterTitles(allMemoFilterTitles)
+      memoFilterInitRef.current = true
+      return
+    }
+    setMemoFilterTitles((prev) => prev.filter((t) => allMemoFilterTitles.includes(t)))
+  }, [allMemoFilterTitles])
+
+  function toggleMemoFilter(title) {
+    const key = String(title ?? "").trim()
+    if (!key) return
+    setMemoFilterTitles((prev) => {
+      const has = prev.includes(key)
+      if (has) return prev.filter((v) => v !== key)
+      return [...prev, key]
+    })
+  }
+
+  const filteredMemoWindows = useMemo(() => {
+    const list = (windows ?? []).filter((w) => w && w.id !== "all")
+    if (activeTabId !== "all") return list
+    const selected = new Set(memoFilterTitles)
+    if (!selected.size) return []
+    return list.filter((w) => selected.has(String(w?.title ?? "").trim()))
+  }, [windows, activeTabId, memoFilterTitles])
 
   function scheduleSave(nextText) {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
@@ -1821,7 +2738,7 @@ function MemoScreen({
       saveTimerRef.current = null
     }
     const nextText = String(draftRef.current ?? "")
-    const currentText = String(rightMemos?.[key] ?? "")
+    const currentText = String(rightMemosRef.current?.[key] ?? "")
     if (nextText !== currentText) {
       Promise.resolve(saveForTab(key, nextText)).catch((_e) => {
         // ignore (onSaveMemo handles alerting)
@@ -1832,39 +2749,10 @@ function MemoScreen({
     if (closeEditor) setIsEditing(false)
   }
 
-  function ensureMemoCardVisible(id) {
-    const key = String(id ?? "")
-    if (!key) return
-    const layout = memoAllCardLayoutsRef.current?.[key]
-    const viewportHeight = Number(memoAllViewportHeightRef.current ?? 0)
-    if (!layout || !Number.isFinite(viewportHeight) || viewportHeight <= 0) return
-    const scrollY = Number(memoAllScrollYRef.current ?? 0)
-    const keyboardInset = Math.max(0, Number(keyboardHeight ?? 0))
-    const baseViewportHeight = Number(memoAllViewportBaseHeightRef.current ?? viewportHeight)
-    const resizedByKeyboard = Math.max(0, baseViewportHeight - viewportHeight)
-    const overlayKeyboardInset = Math.max(0, keyboardInset - resizedByKeyboard)
-    const visibleBottom = scrollY + viewportHeight - overlayKeyboardInset - 12
-    const cardBottom = Number(layout?.y ?? 0) + Number(layout?.height ?? 0)
-    if (cardBottom <= visibleBottom) return
-    const nextY = Math.max(0, scrollY + (cardBottom - visibleBottom))
-    memoAllScrollRef.current?.scrollTo?.({ y: nextY, animated: true })
-  }
-
   const memoPaperBottomPadding = useMemo(() => {
     if (activeTabId === "all" || isEditing) return Math.max(48, keyboardHeight + 24)
     return 48
   }, [activeTabId, isEditing, keyboardHeight])
-
-  useEffect(() => {
-    const targetId =
-      activeTabId === "all" ? String(memoEditingId ?? "") : isEditing ? String(activeTabId ?? "") : ""
-    if (!targetId) return
-    if (keyboardHeight <= 0) return
-    const timer = setTimeout(() => {
-      ensureMemoCardVisible(targetId)
-    }, 40)
-    return () => clearTimeout(timer)
-  }, [activeTabId, isEditing, keyboardHeight, memoEditingId])
 
   function toggleMemoExpanded(id) {
     const key = String(id ?? "")
@@ -1878,33 +2766,56 @@ function MemoScreen({
   function autoSaveMemoEditIfNeeded(id) {
     const key = String(id ?? "")
     if (!key) return
-    const nextText = String(memoEditDrafts?.[key] ?? "")
-    const currentText = String(rightMemos?.[key] ?? "")
+    const nextText = String(memoEditDraftsRef.current?.[key] ?? "")
+    const currentText = String(rightMemosRef.current?.[key] ?? "")
     if (nextText === currentText) return
     Promise.resolve(saveForTab(key, nextText)).catch((_e) => {
       // ignore (onSaveMemo handles alerting)
     })
   }
 
+  useEffect(() => {
+    autoSaveMemoEditRef.current = autoSaveMemoEditIfNeeded
+  }, [autoSaveMemoEditIfNeeded])
+
+  useEffect(() => {
+    finishSingleEditRef.current = finishSingleEdit
+  }, [finishSingleEdit])
+
   function beginMemoEdit(id) {
     const key = String(id ?? "")
     if (!key) return
     const prevKey = String(memoEditingId ?? "")
     if (prevKey && prevKey !== key) autoSaveMemoEditIfNeeded(prevKey)
-    const current = String(rightMemos?.[key] ?? rightMemos?.[id] ?? "")
+    const current = String(rightMemosRef.current?.[key] ?? rightMemosRef.current?.[id] ?? "")
     setMemoEditingId(key)
     setMemoExpandedMap((prev) => ({ ...(prev ?? {}), [key]: true }))
-    setMemoEditDrafts((prev) => ({ ...(prev ?? {}), [key]: current }))
-    setTimeout(() => {
-      memoInputRefs.current?.[key]?.focus?.()
-      ensureMemoCardVisible(key)
-    }, 50)
+    setMemoEditDrafts((prev) => {
+      const next = { ...(prev ?? {}), [key]: current }
+      memoEditDraftsRef.current = next
+      return next
+    })
+    // Enter edit mode. Keep behavior simple and stable for editing.
+  }
+
+  function beginMemoEditFromTap(id) {
+    beginMemoEdit(id)
+  }
+
+  function beginSingleMemoEdit() {
+    if (activeTabId === "all") return
+    setIsEditing(true)
+    // Enter edit mode. Keep behavior simple and stable for editing.
+  }
+
+  function beginSingleMemoEditFromTap() {
+    beginSingleMemoEdit()
   }
 
   async function commitMemoEdit(id) {
     const key = String(id ?? "")
     if (!key) return
-    const text = String(memoEditDrafts?.[key] ?? "")
+    const text = String(memoEditDraftsRef.current?.[key] ?? "")
     await saveForTab(key, text)
     setMemoEditingId(null)
     Keyboard.dismiss()
@@ -1931,6 +2842,8 @@ function MemoScreen({
         loading={loading}
         onRefresh={() => runOutsideContent(onRefresh)}
         onSignOut={() => runOutsideContent(onSignOut)}
+        onFilter={activeTabId === "all" ? () => setMemoFilterVisible(true) : null}
+        filterActive={activeTabId === "all" ? !isAllMemoFiltersSelected : false}
         tone={tone}
         showLogo={false}
         titleStyle={styles.calendarTitleOffset}
@@ -1944,6 +2857,7 @@ function MemoScreen({
         onRenameWindow={(...args) => runOutsideContent(onRenameWindow, ...args)}
         onDeleteWindow={(...args) => runOutsideContent(onDeleteWindow, ...args)}
         onChangeWindowColor={(...args) => runOutsideContent(onChangeWindowColor, ...args)}
+        onReorderWindows={(...args) => runOutsideContent(onReorderWindows, ...args)}
         tone={tone}
       />
       <View style={[styles.card, styles.memoCard, isDark ? styles.cardDark : null, isDark ? styles.memoCardDark : null]}>
@@ -1956,37 +2870,19 @@ function MemoScreen({
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator
             scrollEventThrottle={16}
-            onLayout={(e) => {
-              const nextHeight = e?.nativeEvent?.layout?.height ?? 0
-              memoAllViewportHeightRef.current = nextHeight
-              if (keyboardHeight <= 0 || memoAllViewportBaseHeightRef.current < nextHeight) {
-                memoAllViewportBaseHeightRef.current = nextHeight
-              }
-            }}
-            onScroll={(e) => {
-              memoAllScrollYRef.current = e?.nativeEvent?.contentOffset?.y ?? 0
-            }}
           >
             {activeTabId === "all" ? (
               <View style={styles.memoAllList}>
-                {(windows ?? [])
-                  .filter((w) => w && w.id !== "all")
-                  .map((w) => {
+                {filteredMemoWindows.map((w) => {
                     const key = String(w.id ?? "")
                     const body = String(rightMemos?.[key] ?? rightMemos?.[w.id] ?? "")
                     const isExpanded = memoExpandedMap?.[key] ?? true
                     const isEditingCard = memoEditingId === key
                     const draftValue = memoEditDrafts?.[key] ?? body
                     return (
-                      <View
-                        key={w.id}
-                        style={[styles.memoAllCard, isDark ? styles.cardDark : null]}
-                        onLayout={(e) => {
-                          memoAllCardLayoutsRef.current[key] = e?.nativeEvent?.layout ?? null
-                        }}
-                      >
+                      <View key={w.id} style={[styles.memoAllCard, isDark ? styles.cardDark : null]}>
                         <View style={styles.memoAllHeader}>
-                          <Pressable style={styles.memoAllHeaderLeft} onPress={() => beginMemoEdit(w.id)}>
+                          <Pressable style={styles.memoAllHeaderLeft} onPress={() => beginMemoEditFromTap(w.id)}>
                             <View style={[styles.memoAllDot, { backgroundColor: w.color || "#94a3b8" }]} />
                             <Text style={[styles.memoAllTitle, isDark ? styles.textDark : null]}>{w.title}</Text>
                           </Pressable>
@@ -2013,27 +2909,30 @@ function MemoScreen({
                                 if (ref) memoInputRefs.current[key] = ref
                               }}
                               value={draftValue}
-                              onFocus={() => ensureMemoCardVisible(key)}
-                              onContentSizeChange={() => ensureMemoCardVisible(key)}
+                              autoFocus={false}
                               onBlur={() => {
                                 autoSaveMemoEditIfNeeded(key)
                               }}
                               onChangeText={(t) =>
-                                setMemoEditDrafts((prev) => ({ ...(prev ?? {}), [key]: String(t ?? "") }))
+                                setMemoEditDrafts((prev) => {
+                                  const next = { ...(prev ?? {}), [key]: String(t ?? "") }
+                                  memoEditDraftsRef.current = next
+                                  return next
+                                })
                               }
                               placeholder="메모를 입력하세요"
                               multiline
-                              scrollEnabled={false}
+                              scrollEnabled
                               underlineColorAndroid="transparent"
                               textAlignVertical="top"
                               style={[
                                 styles.memoAllInput,
-                                { fontSize: Math.round(14 * scale), lineHeight: Math.round(20 * scale) },
+                                { fontSize: memoFontSize, lineHeight: memoLineHeight },
                                 isDark ? styles.inputDark : null
                               ]}
                             />
                           ) : (
-                            <Pressable onPress={() => beginMemoEdit(w.id)}>
+                            <Pressable onPress={() => beginMemoEditFromTap(w.id)}>
                               <Text style={[styles.memoAllBody, isDark ? styles.textMutedDark : null]}>
                                 {body.trim() ? body : "내용 없음"}
                               </Text>
@@ -2046,27 +2945,18 @@ function MemoScreen({
               </View>
             ) : (
               <View style={styles.memoAllList}>
-                <View
-                  style={[styles.memoAllCard, isDark ? styles.cardDark : null]}
-                  onLayout={(e) => {
-                    memoAllCardLayoutsRef.current[String(activeTabId ?? "")] = e?.nativeEvent?.layout ?? null
-                  }}
-                >
+                <View style={[styles.memoAllCard, isDark ? styles.cardDark : null]}>
                   <View style={styles.memoAllHeader}>
                     <Pressable
                       style={styles.memoAllHeaderLeft}
                       onPress={() => {
                         if (activeTabId === "all") return
-                        setIsEditing(true)
-                        setTimeout(() => {
-                          inputRef.current?.focus?.()
-                          ensureMemoCardVisible(activeTabId)
-                        }, 50)
+                        beginSingleMemoEditFromTap()
                       }}
                     >
                       <View style={[styles.memoAllDot, { backgroundColor: activeWindow?.color || "#94a3b8" }]} />
                       <Text style={[styles.memoAllTitle, isDark ? styles.textDark : null]}>
-                        {activeWindow?.title || "메모"}
+                        {activeWindow?.title || "\uBA54\uBAA8"}
                       </Text>
                     </Pressable>
                     <View style={styles.memoAllHeaderRight}>
@@ -2087,8 +2977,7 @@ function MemoScreen({
                     <TextInput
                       ref={inputRef}
                       value={draft}
-                      onFocus={() => ensureMemoCardVisible(activeTabId)}
-                      onContentSizeChange={() => ensureMemoCardVisible(activeTabId)}
+                      autoFocus={false}
                       onBlur={() => finishSingleEdit(activeTabId, false)}
                       onChangeText={(t) => {
                         const next = String(t ?? "")
@@ -2100,32 +2989,23 @@ function MemoScreen({
                       }}
                       placeholder={placeholder}
                       multiline
-                      scrollEnabled={false}
+                      scrollEnabled
                       disableFullscreenUI
                       underlineColorAndroid="transparent"
                       textAlignVertical="top"
                       style={[
                         styles.memoAllInput,
                         {
-                          fontSize: Math.round(14 * scale),
-                          lineHeight: Math.round(20 * scale)
+                          fontSize: memoFontSize,
+                          lineHeight: memoLineHeight
                         },
                         isDark ? styles.inputDark : null
                       ]}
                     />
                   ) : (
-                    <Pressable
-                      onPress={() => {
-                        if (activeTabId === "all") return
-                        setIsEditing(true)
-                        setTimeout(() => {
-                          inputRef.current?.focus?.()
-                          ensureMemoCardVisible(activeTabId)
-                        }, 50)
-                      }}
-                    >
+                    <Pressable onPress={() => beginSingleMemoEditFromTap()}>
                       <Text style={[styles.memoAllBody, isDark ? styles.textMutedDark : null]}>
-                        {String(draft ?? "").trim() ? draft : "내용 없음"}
+                        {String(draft ?? "").trim() ? draft : "\uB0B4\uC6A9 \uC5C6\uC74C"}
                       </Text>
                     </Pressable>
                   )}
@@ -2135,6 +3015,64 @@ function MemoScreen({
           </ScrollView>
         </View>
       </View>
+
+      <Modal
+        visible={memoFilterVisible}
+        transparent
+        presentationStyle="overFullScreen"
+        statusBarTranslucent
+        animationType="fade"
+        onRequestClose={() => setMemoFilterVisible(false)}
+      >
+        <View style={styles.dayModalOverlay}>
+          <Pressable style={styles.dayModalBackdrop} onPress={() => setMemoFilterVisible(false)} />
+          <View style={[styles.calendarFilterCard, isDark ? styles.calendarFilterCardDark : null]}>
+            <View style={styles.calendarFilterHeader}>
+              <Text style={[styles.calendarFilterTitle, isDark ? styles.textDark : null]}>{"\uD544\uD130"}</Text>
+              <View style={styles.calendarFilterActions}>
+                <Pressable onPress={() => setMemoFilterTitles(allMemoFilterTitles)} style={styles.calendarFilterResetBtn}>
+                  <Text style={styles.calendarFilterResetText}>{"\uC804\uCCB4"}</Text>
+                </Pressable>
+                <Pressable onPress={() => setMemoFilterVisible(false)} style={styles.calendarFilterDoneBtn}>
+                  <Text style={styles.calendarFilterDoneText}>{"\uB2EB\uAE30"}</Text>
+                </Pressable>
+              </View>
+            </View>
+            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.calendarFilterList}>
+              {memoFilterOptions.map((opt) => {
+                const active = memoFilterTitles.includes(opt.title)
+                return (
+                  <Pressable
+                    key={opt.title}
+                    onPress={() => toggleMemoFilter(opt.title)}
+                    style={[styles.calendarFilterItem, isDark ? styles.calendarFilterItemDark : null]}
+                  >
+                    <View style={styles.calendarFilterItemLeft}>
+                      <View style={[styles.tabDot, { backgroundColor: opt.color }]} />
+                      <Text style={[styles.calendarFilterItemText, isDark ? styles.textDark : null]}>{opt.title}</Text>
+                    </View>
+                    <View
+                      style={[
+                        styles.calendarFilterCheck,
+                        active ? styles.calendarFilterCheckActive : null,
+                        isDark ? styles.calendarFilterCheckDark : null
+                      ]}
+                    >
+                      {active ? <Text style={styles.calendarFilterCheckMark}>{"\u2713"}</Text> : null}
+                    </View>
+                  </Pressable>
+                )
+              })}
+            </ScrollView>
+            <Text style={[styles.calendarFilterHint, isDark ? styles.textMutedDark : null]}>
+              {"\uC120\uD0DD\uD55C \uD56D\uBAA9\uB9CC \uBA54\uBAA8\uC5D0 \uD45C\uC2DC\uB429\uB2C8\uB2E4"}
+            </Text>
+            <Text style={[styles.calendarFilterHint, isDark ? styles.textMutedDark : null]}>
+              {"(\uD1B5\uD569 \uD0ED\uC5D0\uC11C\uB9CC \uC801\uC6A9)"}
+            </Text>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   )
 }
@@ -2145,6 +3083,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
   const [initialSnapshot, setInitialSnapshot] = useState(null)
   const [date, setDate] = useState("")
   const [time, setTime] = useState("")
+  const [endTime, setEndTime] = useState("")
   const [content, setContent] = useState("")
   const [category, setCategory] = useState("__general__")
   const [alarmEnabled, setAlarmEnabled] = useState(true)
@@ -2156,11 +3095,14 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
   const [keyboardHeight, setKeyboardHeight] = useState(0)
   const [showDatePicker, setShowDatePicker] = useState(false)
   const [showTimePicker, setShowTimePicker] = useState(false)
+  const [showEndTimePicker, setShowEndTimePicker] = useState(false)
   const [showRepeatUntilPicker, setShowRepeatUntilPicker] = useState(false)
   const [iosDateSheetVisible, setIosDateSheetVisible] = useState(false)
   const [iosTempDate, setIosTempDate] = useState(new Date())
   const [iosTimeSheetVisible, setIosTimeSheetVisible] = useState(false)
   const [iosTempTime, setIosTempTime] = useState(new Date())
+  const [iosEndTimeSheetVisible, setIosEndTimeSheetVisible] = useState(false)
+  const [iosTempEndTime, setIosTempEndTime] = useState(new Date())
   const [iosRepeatUntilSheetVisible, setIosRepeatUntilSheetVisible] = useState(false)
   const [iosTempRepeatUntil, setIosTempRepeatUntil] = useState(new Date())
 
@@ -2170,9 +3112,11 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
       return
     }
     const repeatMeta = normalizeRepeatMeta(draft ?? {})
+    const draftTimeRange = normalizePlanTimeRange(draft ?? {})
     const initialState = buildPlanEditorSnapshot({
       date: String(draft?.date ?? ""),
-      time: String(draft?.time ?? ""),
+      time: draftTimeRange.time,
+      endTime: draftTimeRange.endTime,
       content: String(draft?.content ?? ""),
       category: String(draft?.category_id ?? "__general__") || "__general__",
       alarmEnabled: Boolean(draft?.alarm_enabled ?? true),
@@ -2184,6 +3128,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
     })
     setDate(initialState.date)
     setTime(initialState.time)
+    setEndTime(initialState.endTime)
     setContent(initialState.content)
     setCategory(initialState.category)
     setAlarmEnabled(initialState.alarmEnabled)
@@ -2195,11 +3140,22 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
     setInitialSnapshot(initialState)
     setShowDatePicker(false)
     setShowTimePicker(false)
+    setShowEndTimePicker(false)
     setShowRepeatUntilPicker(false)
     setIosDateSheetVisible(false)
     setIosTimeSheetVisible(false)
+    setIosEndTimeSheetVisible(false)
     setIosRepeatUntilSheetVisible(false)
     setIosTempRepeatUntil(parseDateKey(String(repeatMeta.repeatUntil ?? "")) ?? parseDateKey(String(draft?.date ?? "")) ?? new Date())
+    const pickerSeed = normalizeClockTime(initialState.endTime || initialState.time)
+    if (pickerSeed) {
+      const [hText, mText] = pickerSeed.split(":")
+      const next = new Date()
+      next.setHours(Number(hText), Number(mText), 0, 0)
+      setIosTempEndTime(next)
+    } else {
+      setIosTempEndTime(new Date())
+    }
   }, [visible, draft])
 
   useEffect(() => {
@@ -2229,15 +3185,27 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
   }, [isKeyboardOpen, keyboardHeight, safeBottomInset])
   const dateValue = useMemo(() => parseDateKey(date) ?? new Date(), [date])
   const timeValue = useMemo(() => {
-    if (!time) return new Date()
-    const parts = String(time).split(":")
+    const normalized = normalizeClockTime(time)
+    if (!normalized) return new Date()
+    const parts = String(normalized).split(":")
     const h = Number(parts[0] ?? 0)
     const m = Number(parts[1] ?? 0)
     const next = new Date()
     next.setHours(Number.isFinite(h) ? h : 0, Number.isFinite(m) ? m : 0, 0, 0)
     return next
   }, [time])
+  const endTimeValue = useMemo(() => {
+    const normalized = normalizeClockTime(endTime)
+    if (!normalized) return timeValue
+    const parts = String(normalized).split(":")
+    const h = Number(parts[0] ?? 0)
+    const m = Number(parts[1] ?? 0)
+    const next = new Date()
+    next.setHours(Number.isFinite(h) ? h : 0, Number.isFinite(m) ? m : 0, 0, 0)
+    return next
+  }, [endTime, timeValue])
   const timeDisplay = useMemo(() => (time ? formatTimeForDisplay(time) : ""), [time])
+  const endTimeDisplay = useMemo(() => (endTime ? formatTimeForDisplay(endTime) : ""), [endTime])
   const alarmLeadOptions = useMemo(
     () => [
       { key: 0, label: "정시" },
@@ -2288,6 +3256,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
       buildPlanEditorSnapshot({
         date,
         time,
+        endTime,
         content,
         category,
         alarmEnabled,
@@ -2297,7 +3266,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
         repeatDays,
         repeatUntil
       }),
-    [date, time, content, category, alarmEnabled, alarmLeadMinutes, repeatType, repeatInterval, repeatDays, repeatUntil]
+    [date, time, endTime, content, category, alarmEnabled, alarmLeadMinutes, repeatType, repeatInterval, repeatDays, repeatUntil]
   )
   const hasChanges = useMemo(() => {
     if (!visible || !initialSnapshot) return false
@@ -2334,14 +3303,26 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
   function handleSave() {
     if (!date) return
     if (!content.trim()) return
+    const normalizedTime = normalizeClockTime(time)
+    let normalizedEndTime = normalizeClockTime(endTime)
+    if (normalizedEndTime && !normalizedTime) {
+      Alert.alert("입력 확인", "종료시간을 쓰려면 시작시간을 먼저 선택해주세요.")
+      return
+    }
+    if (normalizedTime && normalizedEndTime && normalizedTime === normalizedEndTime) {
+      Alert.alert("입력 확인", "시작시간과 종료시간은 같을 수 없어요.")
+      return
+    }
+    if (!normalizedTime) normalizedEndTime = ""
     const payload = {
       ...(draft ?? {}),
       date,
-      time: String(time ?? "").trim(),
+      time: normalizedTime,
+      end_time: normalizedEndTime || null,
       content: String(content ?? "").trim(),
       category_id: category,
-      alarm_enabled: Boolean(time) ? Boolean(alarmEnabled) : false,
-      alarm_lead_minutes: Boolean(time) && Boolean(alarmEnabled) ? normalizeAlarmLeadMinutes(alarmLeadMinutes) : 0,
+      alarm_enabled: Boolean(normalizedTime) ? Boolean(alarmEnabled) : false,
+      alarm_lead_minutes: Boolean(normalizedTime) && Boolean(alarmEnabled) ? normalizeAlarmLeadMinutes(alarmLeadMinutes) : 0,
       repeat_type: repeatType,
       repeat_interval: repeatType === "none" ? 1 : normalizeRepeatInterval(repeatInterval),
       repeat_days: repeatType === "weekly" ? normalizeRepeatDays(repeatDays) : null,
@@ -2512,6 +3493,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
                     <Pressable
                       onPress={() => {
                         setTime("")
+                        setEndTime("")
                         setAlarmEnabled(false)
                       }}
                       style={[styles.editorPickerClearPill, isDark ? styles.editorPickerClearPillDark : null]}
@@ -2521,6 +3503,39 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
                     </Pressable>
                   ) : null}
                   <Text style={styles.editorPickerHint}>선택</Text>
+                </View>
+              </Pressable>
+              <Pressable
+                style={[styles.editorPickerRow, isDark ? styles.editorPickerRowDark : null, styles.editorRangeRow]}
+                onPress={() => {
+                  if (!time) {
+                    Alert.alert("입력 안내", "종료시간을 먼저 고르려면 시작시간을 선택해주세요.")
+                    return
+                  }
+                  if (Platform.OS === "ios") {
+                    setIosTempEndTime(endTime ? endTimeValue : timeValue)
+                    setIosEndTimeSheetVisible(true)
+                    return
+                  }
+                  setShowEndTimePicker(true)
+                }}
+              >
+                <View style={styles.editorPickerLeft}>
+                  <Text style={[styles.editorPickerValue, isDark ? styles.textDark : null]}>
+                    {endTime ? endTimeDisplay : "종료시간 없음"}
+                  </Text>
+                </View>
+                <View style={styles.editorPickerRight}>
+                  {endTime ? (
+                    <Pressable
+                      onPress={() => setEndTime("")}
+                      style={[styles.editorPickerClearPill, isDark ? styles.editorPickerClearPillDark : null]}
+                      hitSlop={8}
+                    >
+                      <Text style={[styles.editorPickerClearText, isDark ? styles.textDark : null]}>없음</Text>
+                    </Pressable>
+                  ) : null}
+                  <Text style={styles.editorPickerHint}>종료</Text>
                 </View>
               </Pressable>
               <View style={styles.editorAlarmRow}>
@@ -2752,7 +3767,29 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
           setIosTimeSheetVisible(false)
           if (!selected) return
           if (!time) setAlarmEnabled(true)
-          setTime(`${pad2(selected.getHours())}:${pad2(selected.getMinutes())}`)
+          const nextTime = `${pad2(selected.getHours())}:${pad2(selected.getMinutes())}`
+          setTime(nextTime)
+          setEndTime((prev) => (normalizeClockTime(prev) === nextTime ? "" : prev))
+        }}
+      />
+      <PickerSheet
+        visible={iosEndTimeSheetVisible}
+        title="종료시간 선택"
+        value={iosTempEndTime}
+        mode="time"
+        is24Hour={false}
+        tone={tone}
+        onCancel={() => setIosEndTimeSheetVisible(false)}
+        onConfirm={(selected) => {
+          setIosEndTimeSheetVisible(false)
+          if (!selected) return
+          const nextEndTime = `${pad2(selected.getHours())}:${pad2(selected.getMinutes())}`
+          if (normalizeClockTime(time) && nextEndTime === normalizeClockTime(time)) {
+            Alert.alert("입력 확인", "시작시간과 종료시간은 같을 수 없어요.")
+            setEndTime("")
+            return
+          }
+          setEndTime(nextEndTime)
         }}
       />
       <PickerSheet
@@ -2802,7 +3839,28 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
             setShowTimePicker(false)
             if (!selected) return
             if (!time) setAlarmEnabled(true)
-            setTime(`${pad2(selected.getHours())}:${pad2(selected.getMinutes())}`)
+            const nextTime = `${pad2(selected.getHours())}:${pad2(selected.getMinutes())}`
+            setTime(nextTime)
+            setEndTime((prev) => (normalizeClockTime(prev) === nextTime ? "" : prev))
+          }}
+        />
+      ) : null}
+      {Platform.OS === "android" && showEndTimePicker ? (
+        <DateTimePicker
+          value={endTime ? endTimeValue : timeValue}
+          mode="time"
+          display="clock"
+          is24Hour={false}
+          onChange={(_event, selected) => {
+            setShowEndTimePicker(false)
+            if (!selected) return
+            const nextEndTime = `${pad2(selected.getHours())}:${pad2(selected.getMinutes())}`
+            if (normalizeClockTime(time) && nextEndTime === normalizeClockTime(time)) {
+              Alert.alert("입력 확인", "시작시간과 종료시간은 같을 수 없어요.")
+              setEndTime("")
+              return
+            }
+            setEndTime(nextEndTime)
           }}
         />
       ) : null}
@@ -2867,6 +3925,7 @@ function CalendarScreen({
   onRenameWindow,
   onDeleteWindow,
   onChangeWindowColor,
+  onReorderWindows,
   holidaysByDate,
   ensureHolidayYear,
   onAddPlan,
@@ -3052,6 +4111,7 @@ function CalendarScreen({
         onRenameWindow={onRenameWindow}
         onDeleteWindow={onDeleteWindow}
         onChangeWindowColor={onChangeWindowColor}
+        onReorderWindows={onReorderWindows}
         tone={tone}
       />
 	      <View
@@ -3303,7 +4363,7 @@ function CalendarScreen({
               ) : (
                 dayItems.map((item) => {
                   const line = formatLine(item)
-                  const time = item?.time ? String(item.time).trim() : ""
+                  const time = buildPlanTimeTextFromRow(item)
                   return (
                     <Pressable
                       key={item.id ?? `${item.date}-${item.content}`}
@@ -3403,6 +4463,10 @@ function AppInner() {
   const lastCalendarDateKeyRef = useRef(null)
   const repeatColumnsSupportedRef = useRef(true)
   const repeatFallbackNoticeRef = useRef(false)
+  const endTimeColumnSupportedRef = useRef(true)
+  const endTimeFallbackNoticeRef = useRef(false)
+  const sortOrderSupportedRef = useRef(true)
+  const sortOrderFallbackNoticeRef = useRef(false)
   const notificationPermissionCheckedRef = useRef(false)
   const notificationPermissionGrantedRef = useRef(false)
   const notificationSyncSeqRef = useRef(0)
@@ -3595,7 +4659,7 @@ function AppInner() {
       const leadMinutes = rowId ? normalizeAlarmLeadMinutes(alarmLeadByPlanId?.[rowId] ?? 0) : 0
       const triggerAt = new Date(when.getTime() - leadMinutes * 60 * 1000)
       if (!Number.isFinite(triggerAt.getTime())) continue
-      const timeText = formatTimeForDisplay(String(row?.time ?? ""))
+      const timeText = formatPlanTimeForDisplay(row)
       const rawCategory = String(row?.category_id ?? "").trim()
       const categoryLabel = !rawCategory || rawCategory === "__general__" ? "통합" : rawCategory
       const contentText = String(row?.content ?? "").trim() || "내용 없음"
@@ -3918,8 +4982,31 @@ function AppInner() {
       setPlans([])
     } else {
       setPlans(data ?? [])
+      await backfillSortOrderFromLegacy(userId, data ?? [])
     }
     setLoading(false)
+  }
+
+  async function backfillSortOrderFromLegacy(userId, rows) {
+    if (!sortOrderSupportedRef.current) return
+    const list = Array.isArray(rows) ? rows : []
+    if (list.length === 0) return
+    const updates = []
+    for (const row of list) {
+      const rowId = String(row?.id ?? "").trim()
+      if (!rowId) continue
+      const existing = parseSortOrderValue(row?.sort_order ?? row?.sortOrder)
+      if (existing != null) continue
+      const legacy = parseSortOrderValue(row?.order)
+      if (legacy == null) continue
+      updates.push({ id: rowId, order: legacy })
+    }
+    if (updates.length === 0) return
+    try {
+      await updatePlanSortOrders(userId, updates, Date.now())
+    } catch (_e) {
+      // ignore legacy backfill errors
+    }
   }
 
   async function loadWindows(userId) {
@@ -4046,6 +5133,64 @@ function AppInner() {
     await loadWindows(userId)
   }
 
+    async function reorderWindows(orderedWindows) {
+    const userId = session?.user?.id
+    const list = Array.isArray(orderedWindows) ? orderedWindows : []
+    const orderedIds = list.map((item) => String(item?.id ?? "").trim()).filter(Boolean)
+    if (orderedIds.length === 0) return
+    const allMovableIds = (windows ?? [])
+      .filter((w) => !w?.fixed)
+      .map((w) => String(w?.id ?? "").trim())
+      .filter(Boolean)
+    const missingIds = allMovableIds.filter((id) => !orderedIds.includes(id))
+    const nextIds = missingIds.length ? [...orderedIds, ...missingIds] : orderedIds
+
+    setWindows((prev) => {
+      const fixedTabs = (prev ?? []).filter((w) => w?.fixed)
+      const movableMap = new Map((prev ?? []).filter((w) => !w?.fixed).map((w) => [String(w?.id ?? ""), w]))
+      const nextMovable = nextIds.map((id) => movableMap.get(id)).filter(Boolean)
+      if (movableMap.size > nextMovable.length) {
+        const used = new Set(nextMovable.map((w) => String(w?.id ?? "")))
+        for (const [id, item] of movableMap.entries()) {
+          if (!used.has(id)) nextMovable.push(item)
+        }
+      }
+      return [...fixedTabs, ...nextMovable]
+    })
+
+    if (!supabase || !userId) return
+
+    try {
+      const movableMap = new Map(
+        (windows ?? [])
+          .filter((w) => !w?.fixed)
+          .map((w) => [String(w?.id ?? ""), w])
+      )
+      const payloads = nextIds
+        .map((id, idx) => {
+          const row = movableMap.get(id)
+          const title = String(row?.title ?? "").trim()
+          if (!title) return null
+          return {
+            id,
+            user_id: userId,
+            title,
+            color: row?.color || "#3b82f6",
+            is_fixed: false,
+            sort_order: (idx + 1) * 10
+          }
+        })
+        .filter(Boolean)
+      if (payloads.length === 0) return
+      const { error } = await supabase.from("windows").upsert(payloads, { onConflict: "id" })
+      if (error) throw error
+    } catch (error) {
+      const message = error?.message || "Save failed."
+      Alert.alert("정렬 저장 실패", message)
+      await loadWindows(userId)
+    }
+  }
+
   async function deleteWindow(windowItem) {
     const userId = session?.user?.id
     if (!supabase || !userId) return
@@ -4120,10 +5265,28 @@ function AppInner() {
     setRightMemos((prev) => ({ ...(prev ?? {}), [id]: text }))
   }
 
-  function buildSinglePlanPayload(userId, next, { seriesIdOverride, dateOverride } = {}) {
+  function getNextSortOrderForDate(dateKey, planRows) {
+    if (!sortOrderSupportedRef.current) return null
+    const key = String(dateKey ?? "").trim()
+    if (!key) return null
+    const list = (planRows ?? []).filter(
+      (row) => row && !row?.deleted_at && String(row?.date ?? "").trim() === key
+    )
+    if (list.length === 0) return 0
+    const values = list
+      .map((row) => parseSortOrderValue(row?.sort_order ?? row?.sortOrder ?? row?.order))
+      .filter((n) => n != null)
+    if (values.length === 0) return null
+    return Math.max(...values) + 1
+  }
+
+  function buildSinglePlanPayload(userId, next, { seriesIdOverride, dateOverride, sortOrderOverride } = {}) {
     const dateKey = String(dateOverride ?? next?.date ?? "").trim()
     const repeatMeta = normalizeRepeatMeta({ ...(next ?? {}), date: dateKey })
     const repeatType = repeatMeta.repeatType
+    const normalizedTime = normalizeClockTime(next?.time)
+    let normalizedEndTime = normalizeClockTime(next?.end_time ?? next?.endTime)
+    if (!normalizedTime || !normalizedEndTime || normalizedEndTime === normalizedTime) normalizedEndTime = ""
     const candidateSeries =
       typeof seriesIdOverride === "string"
         ? String(seriesIdOverride).trim()
@@ -4131,10 +5294,10 @@ function AppInner() {
           ? ""
           : String(repeatMeta.seriesId ?? "").trim()
 
-    return {
+    const payload = {
       user_id: userId,
       date: dateKey,
-      time: String(next?.time ?? "").trim() || null,
+      time: normalizedTime || null,
       content: String(next?.content ?? "").trim(),
       category_id: String(next?.category_id ?? "__general__").trim() || "__general__",
       series_id: repeatType === "none" ? null : candidateSeries || null,
@@ -4145,11 +5308,36 @@ function AppInner() {
       client_id: clientId || null,
       updated_at: new Date().toISOString()
     }
+    if (endTimeColumnSupportedRef.current) payload.end_time = normalizedEndTime || null
+    if (sortOrderOverride != null) payload.sort_order = sortOrderOverride
+    return payload
   }
 
   function stripRepeatColumns(payload) {
     const { series_id, repeat_type, repeat_interval, repeat_days, repeat_until, ...rest } = payload ?? {}
     return rest
+  }
+
+  function stripEndTimeColumns(payload) {
+    const rest = { ...(payload ?? {}) }
+    delete rest.end_time
+    delete rest.original_end_time
+    delete rest.endTime
+    return rest
+  }
+
+  function stripEndTimeFromRows(rows) {
+    const list = Array.isArray(rows) ? rows : []
+    return list.map((row) => stripEndTimeColumns(row))
+  }
+
+  function stripSortOrderFromRows(rows) {
+    const list = Array.isArray(rows) ? rows : []
+    return list.map((row) => {
+      const next = { ...(row ?? {}) }
+      delete next.sort_order
+      return next
+    })
   }
 
 function isRepeatColumnError(error) {
@@ -4172,6 +5360,18 @@ function isDuplicateConflictError(error) {
   return msg.includes("duplicate key value") || msg.includes("unique constraint")
 }
 
+function isSortOrderColumnError(error) {
+  const msg = String(error?.message ?? "").toLowerCase()
+  if (!msg) return false
+  return msg.includes("sort_order") || (msg.includes("column") && msg.includes("sort") && msg.includes("order"))
+}
+
+function isEndTimeColumnError(error) {
+  const msg = String(error?.message ?? "").toLowerCase()
+  if (!msg) return false
+  return msg.includes("end_time") || (msg.includes("column") && msg.includes("end") && msg.includes("time"))
+}
+
   function markRepeatFallbackNotice() {
     if (!repeatColumnsSupportedRef.current) return
     repeatColumnsSupportedRef.current = false
@@ -4181,11 +5381,37 @@ function isDuplicateConflictError(error) {
     setAuthMessage("반복 일정 DB 컬럼이 없어 기본 저장 모드로 동작합니다. SQL 마이그레이션을 적용하면 반복 범위 수정이 완전히 동작해요.")
   }
 
-  function buildRecurringRows(userId, next, { seriesIdOverride } = {}) {
+  function markSortOrderFallbackNotice() {
+    if (!sortOrderSupportedRef.current) return
+    sortOrderSupportedRef.current = false
+    if (sortOrderFallbackNoticeRef.current) return
+    sortOrderFallbackNoticeRef.current = true
+    setAuthMessageTone("info")
+    setAuthMessage("정렬 순서 컬럼(sort_order)이 없어 시간 없는 일정의 순서가 기기 간에 완전히 동기화되지 않을 수 있습니다.")
+  }
+
+  function markEndTimeFallbackNotice() {
+    if (!endTimeColumnSupportedRef.current) return
+    endTimeColumnSupportedRef.current = false
+    if (endTimeFallbackNoticeRef.current) return
+    endTimeFallbackNoticeRef.current = true
+    setAuthMessageTone("info")
+    setAuthMessage("종료시간 DB 컬럼(end_time)이 없어 종료시간 없이 저장됩니다. SQL 마이그레이션을 적용하면 시간 구간이 동기화됩니다.")
+  }
+
+  function buildRecurringRows(userId, next, { seriesIdOverride, forceSortOrder = false } = {}) {
     const dateKey = String(next?.date ?? "").trim()
     const repeatMeta = normalizeRepeatMeta({ ...(next ?? {}), date: dateKey })
     if (repeatMeta.repeatType === "none") {
-      return [buildSinglePlanPayload(userId, next, { seriesIdOverride: null, dateOverride: dateKey })]
+      const shouldAssignSortOrder = sortOrderSupportedRef.current && (forceSortOrder || !next?.id)
+      const baseSortOrder = shouldAssignSortOrder ? getNextSortOrderForDate(dateKey, plans) : null
+      return [
+        buildSinglePlanPayload(userId, next, {
+          seriesIdOverride: null,
+          dateOverride: dateKey,
+          sortOrderOverride: baseSortOrder
+        })
+      ]
     }
     const seriesId = String(seriesIdOverride ?? repeatMeta.seriesId ?? genSeriesId()).trim() || genSeriesId()
     const dateKeys = generateRecurringDateKeys({
@@ -4195,7 +5421,28 @@ function isDuplicateConflictError(error) {
       repeatDays: repeatMeta.repeatDays ?? [],
       repeatUntilKey: repeatMeta.repeatUntil
     })
-    return dateKeys.map((key) => buildSinglePlanPayload(userId, next, { seriesIdOverride: seriesId, dateOverride: key }))
+    const shouldAssignSortOrder = sortOrderSupportedRef.current && (forceSortOrder || !next?.id)
+    const sortOrderSeeds = new Map()
+    return dateKeys.map((key) => {
+      let sortOrderOverride = null
+      if (shouldAssignSortOrder) {
+        if (sortOrderSeeds.has(key)) {
+          sortOrderOverride = sortOrderSeeds.get(key)
+          sortOrderSeeds.set(key, sortOrderOverride + 1)
+        } else {
+          const seed = getNextSortOrderForDate(key, plans)
+          if (seed != null) {
+            sortOrderOverride = seed
+            sortOrderSeeds.set(key, seed + 1)
+          }
+        }
+      }
+      return buildSinglePlanPayload(userId, next, {
+        seriesIdOverride: seriesId,
+        dateOverride: key,
+        sortOrderOverride
+      })
+    })
   }
 
   async function insertPlansInChunks(rows) {
@@ -4203,12 +5450,26 @@ function isDuplicateConflictError(error) {
     const chunkSize = 200
     const insertedIds = []
     for (let i = 0; i < rows.length; i += chunkSize) {
-      const chunk = rows.slice(i, i + chunkSize)
-      let { data, error } = await supabase.from("plans").insert(chunk).select("id")
+      let insertChunk = rows.slice(i, i + chunkSize)
+      let { data, error } = await supabase.from("plans").insert(insertChunk).select("id")
       if (error && isRepeatColumnError(error)) {
         markRepeatFallbackNotice()
-        const plainChunk = chunk.map((row) => stripRepeatColumns(row))
-        const retry = await supabase.from("plans").insert(plainChunk).select("id")
+        insertChunk = insertChunk.map((row) => stripRepeatColumns(row))
+        const retry = await supabase.from("plans").insert(insertChunk).select("id")
+        data = retry.data
+        error = retry.error
+      }
+      if (error && isEndTimeColumnError(error)) {
+        markEndTimeFallbackNotice()
+        insertChunk = stripEndTimeFromRows(insertChunk)
+        const retry = await supabase.from("plans").insert(insertChunk).select("id")
+        data = retry.data
+        error = retry.error
+      }
+      if (error && isSortOrderColumnError(error)) {
+        markSortOrderFallbackNotice()
+        insertChunk = stripSortOrderFromRows(insertChunk)
+        const retry = await supabase.from("plans").insert(insertChunk).select("id")
         data = retry.data
         error = retry.error
       }
@@ -4228,7 +5489,48 @@ function isDuplicateConflictError(error) {
       const retry = await supabase.from("plans").update(stripRepeatColumns(payload)).eq("id", id).eq("user_id", userId)
       error = retry.error
     }
+    if (error && isEndTimeColumnError(error)) {
+      markEndTimeFallbackNotice()
+      const retry = await supabase.from("plans").update(stripEndTimeColumns(payload)).eq("id", id).eq("user_id", userId)
+      error = retry.error
+    }
     if (error) throw error
+  }
+
+  async function updatePlanSortOrders(userId, updates, baseMs = Date.now()) {
+    if (!supabase || !userId) return
+    const list = Array.isArray(updates) ? updates : []
+    if (list.length === 0) return
+    const payloads = list.map((item, idx) => ({
+      id: String(item?.id ?? "").trim(),
+      user_id: userId,
+      sort_order: item?.order ?? idx,
+      updated_at: new Date(baseMs + idx).toISOString(),
+      client_id: clientId || null
+    })).filter((row) => row.id)
+
+    if (payloads.length === 0) return
+    if (sortOrderSupportedRef.current) {
+      const { error } = await supabase.from("plans").upsert(payloads, { onConflict: "id" })
+      if (error) {
+        if (isSortOrderColumnError(error)) {
+          markSortOrderFallbackNotice()
+        } else {
+          throw error
+        }
+      } else {
+        return
+      }
+    }
+
+    const fallbackPayloads = payloads.map(({ id, user_id, updated_at, client_id }) => ({
+      id,
+      user_id,
+      updated_at,
+      client_id
+    }))
+    const { error: fallbackError } = await supabase.from("plans").upsert(fallbackPayloads, { onConflict: "id" })
+    if (fallbackError) throw fallbackError
   }
 
   function applyLegacySeriesMatch(query, target, { futureOnly = false } = {}) {
@@ -4236,11 +5538,16 @@ function isDuplicateConflictError(error) {
     const baseDate = String(target?.original_date ?? target?.date ?? "").trim()
     const baseCategory = String(target?.original_category_id ?? target?.category_id ?? "__general__").trim() || "__general__"
     const baseContent = String(target?.original_content ?? target?.content ?? "").trim()
-    const baseTime = String(target?.original_time ?? target?.time ?? "").trim()
+    const baseTime = normalizeClockTime(target?.original_time ?? target?.time)
+    const baseEndTime = normalizeClockTime(target?.original_end_time ?? target?.end_time ?? target?.endTime)
 
     nextQuery = nextQuery.eq("category_id", baseCategory).eq("content", baseContent)
     if (baseTime) nextQuery = nextQuery.eq("time", baseTime)
     else nextQuery = nextQuery.is("time", null)
+    if (endTimeColumnSupportedRef.current) {
+      if (baseEndTime && baseEndTime !== baseTime) nextQuery = nextQuery.eq("end_time", baseEndTime)
+      else nextQuery = nextQuery.is("end_time", null)
+    }
     if (futureOnly && baseDate) nextQuery = nextQuery.gte("date", baseDate)
     return nextQuery
   }
@@ -4248,7 +5555,15 @@ function isDuplicateConflictError(error) {
   async function fetchLegacySeriesIds(userId, target, { futureOnly = false } = {}) {
     let query = supabase.from("plans").select("id").eq("user_id", userId).is("deleted_at", null)
     query = applyLegacySeriesMatch(query, target, { futureOnly })
-    const { data, error } = await query
+    let { data, error } = await query
+    if (error && isEndTimeColumnError(error)) {
+      markEndTimeFallbackNotice()
+      let retryQuery = supabase.from("plans").select("id").eq("user_id", userId).is("deleted_at", null)
+      retryQuery = applyLegacySeriesMatch(retryQuery, target, { futureOnly })
+      const retry = await retryQuery
+      data = retry.data
+      error = retry.error
+    }
     if (error) throw error
     return (data ?? []).map((row) => row?.id).filter(Boolean)
   }
@@ -4278,7 +5593,7 @@ function isDuplicateConflictError(error) {
     const dateKey = String(next?.date ?? "").trim()
     const contentText = String(next?.content ?? "").trim()
     if (!dateKey || !contentText) return false
-    const hasTimeText = Boolean(String(next?.time ?? "").trim())
+    const hasTimeText = Boolean(normalizeClockTime(next?.time))
     const nextAlarmEnabled = hasTimeText ? Boolean(next?.alarm_enabled ?? true) : true
     const nextAlarmLeadMinutes = hasTimeText && nextAlarmEnabled ? normalizeAlarmLeadMinutes(next?.alarm_lead_minutes) : 0
 
@@ -4298,8 +5613,18 @@ function isDuplicateConflictError(error) {
       const shouldRegenerate = Boolean(next?.id) && (editScope === "future" || editScope === "all" || enableRecurringFromSingle)
 
       if (next?.id && !shouldRegenerate) {
+        const nextDate = String(next?.date ?? "").trim()
+        const originalDate = String(next?.original_date ?? "").trim()
+        const nextTime = normalizeClockTime(next?.time)
+        const originalTime = normalizeClockTime(next?.original_time)
+        const dateChanged = originalDate && nextDate && nextDate !== originalDate
+        const becameNoTime = Boolean(originalTime) && !nextTime
+        const shouldAssignSortOrder =
+          sortOrderSupportedRef.current && !nextTime && (dateChanged || becameNoTime)
+        const sortOrderOverride = shouldAssignSortOrder ? getNextSortOrderForDate(nextDate, plans) : null
         const payload = buildSinglePlanPayload(userId, next, {
-          seriesIdOverride: nextRepeatType === "none" ? null : sourceSeriesId || null
+          seriesIdOverride: nextRepeatType === "none" ? null : sourceSeriesId || null,
+          sortOrderOverride
         })
         await updatePlanRow(userId, next.id, payload)
         affectedPlanIds = [String(next.id)]
@@ -4323,7 +5648,8 @@ function isDuplicateConflictError(error) {
 
         const rows = buildRecurringRows(userId, next, {
           // Regenerate with a new series id so insert can succeed before old rows are removed.
-          seriesIdOverride: nextRepeatType === "none" ? null : genSeriesId()
+          seriesIdOverride: nextRepeatType === "none" ? null : genSeriesId(),
+          forceSortOrder: true
         })
         let deletedBeforeInsert = false
         const softDeleteOldRows = async () => {
@@ -4377,7 +5703,8 @@ function isDuplicateConflictError(error) {
         await softDeleteOldRows()
       } else {
         const rows = buildRecurringRows(userId, next, {
-          seriesIdOverride: nextRepeatType === "none" ? null : genSeriesId()
+          seriesIdOverride: nextRepeatType === "none" ? null : genSeriesId(),
+          forceSortOrder: true
         })
         affectedPlanIds = await insertPlansInChunks(rows)
       }
@@ -4393,6 +5720,44 @@ function isDuplicateConflictError(error) {
       return false
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function reorderNoTimePlans(dateKey, orderedItems) {
+    const key = String(dateKey ?? "").trim()
+    if (!key) return
+    const list = Array.isArray(orderedItems) ? orderedItems : []
+    const orderedIds = list
+      .map((item) => String(item?.id ?? "").trim())
+      .filter(Boolean)
+    if (orderedIds.length === 0) return
+
+    const orderMap = new Map(orderedIds.map((id, idx) => [id, idx]))
+    const baseMs = Date.now()
+    setPlans((prev) =>
+      (prev ?? []).map((row) => {
+        const rowDate = String(row?.date ?? "").trim()
+        if (rowDate !== key) return row
+        const rowId = String(row?.id ?? "").trim()
+        if (!rowId || !orderMap.has(rowId)) return row
+        const sortOrder = orderMap.get(rowId)
+        return {
+          ...row,
+          sort_order: sortOrder,
+          updated_at: new Date(baseMs + sortOrder).toISOString()
+        }
+      })
+    )
+
+    const userId = session?.user?.id
+    if (!supabase || !userId) return
+    try {
+      const updates = orderedIds.map((id, idx) => ({ id, order: idx }))
+      await updatePlanSortOrders(userId, updates, baseMs)
+    } catch (error) {
+      const message = error?.message || "Save failed."
+      Alert.alert("정렬 저장 실패", message)
+      await loadPlans(userId)
     }
   }
 
@@ -4502,6 +5867,7 @@ function isDuplicateConflictError(error) {
     setPlanDraft({
       date: String(dateKey ?? ""),
       time: "",
+      end_time: null,
       alarm_enabled: true,
       alarm_lead_minutes: 0,
       content: "",
@@ -4529,7 +5895,9 @@ function isDuplicateConflictError(error) {
     const baseDate = String(item.date ?? "")
     const baseCategory = String(item.category_id ?? "__general__").trim() || "__general__"
     const baseContent = String(item.content ?? "").trim()
-    const baseTime = String(item.time ?? "").trim()
+    const baseTimeRange = normalizePlanTimeRange(item)
+    const baseTime = baseTimeRange.time
+    const baseEndTime = baseTimeRange.endTime
     const itemId = String(item?.id ?? "").trim()
     const alarmDisabled = itemId ? Boolean(alarmDisabledByPlanId?.[itemId]) : false
     const alarmEnabledByRow = item?.alarm_enabled == null ? true : Boolean(item?.alarm_enabled)
@@ -4542,10 +5910,13 @@ function isDuplicateConflictError(error) {
         if (!parseDateKey(rowDate)) return false
         const rowCategory = String(row?.category_id ?? "__general__").trim() || "__general__"
         const rowContent = String(row?.content ?? "").trim()
-        const rowTime = String(row?.time ?? "").trim()
+        const rowTimeRange = normalizePlanTimeRange(row)
+        const rowTime = rowTimeRange.time
+        const rowEndTime = rowTimeRange.endTime
         if (rowCategory !== baseCategory) return false
         if (rowContent !== baseContent) return false
         if (rowTime !== baseTime) return false
+        if (rowEndTime !== baseEndTime) return false
         return true
       })
       .sort((a, b) => String(a?.date ?? "").localeCompare(String(b?.date ?? "")))
@@ -4563,9 +5934,11 @@ function isDuplicateConflictError(error) {
       date: baseDate,
       original_date: baseDate,
       time: baseTime,
+      end_time: baseEndTime || null,
       alarm_enabled: effectiveAlarmEnabled,
       alarm_lead_minutes: effectiveAlarmLeadMinutes,
       original_time: baseTime,
+      original_end_time: baseEndTime || null,
       content: baseContent,
       original_content: baseContent,
       category_id: baseCategory,
@@ -4599,7 +5972,7 @@ function isDuplicateConflictError(error) {
     const keys = [...map.keys()].sort()
     return keys.map((key) => ({
       title: key,
-      data: [...(map.get(key) ?? [])].sort(sortItems)
+      data: sortItemsByTimeAndOrder(map.get(key) ?? [])
     }))
   }, [filteredPlans])
 
@@ -4611,10 +5984,23 @@ function isDuplicateConflictError(error) {
       map.get(key).push(row)
     }
     for (const [key, items] of map.entries()) {
-      map.set(key, [...items].sort(sortItems))
+      map.set(key, sortItemsByTimeAndOrder(items))
     }
     return map
   }, [filteredPlans])
+
+  const allItemsByDate = useMemo(() => {
+    const map = new Map()
+    for (const row of plans ?? []) {
+      const key = String(row?.date ?? "no-date")
+      if (!map.has(key)) map.set(key, [])
+      map.get(key).push(row)
+    }
+    for (const [key, items] of map.entries()) {
+      map.set(key, sortItemsByTimeAndOrder(items))
+    }
+    return map
+  }, [plans])
 
   const memoText = useMemo(() => {
     if (activeTabId !== "all") return rightMemos[activeTabId] ?? ""
@@ -4840,6 +6226,7 @@ function isDuplicateConflictError(error) {
           {() => (
             <ListScreen
               sections={sections}
+              allItemsByDate={allItemsByDate}
               loading={loading}
               windows={windows}
               activeTabId={activeTabId}
@@ -4848,10 +6235,12 @@ function isDuplicateConflictError(error) {
               onRenameWindow={renameWindow}
               onDeleteWindow={deleteWindow}
               onChangeWindowColor={changeWindowColor}
+              onReorderWindows={reorderWindows}
               holidaysByDate={holidaysByDate}
               ensureHolidayYear={ensureHolidayYear}
               onAddPlan={openNewPlan}
               onEditPlan={openEditPlan}
+              onReorderNoTime={reorderNoTimePlans}
               onRefresh={() => {
                 loadPlans(session?.user?.id)
                 loadWindows(session?.user?.id)
@@ -4876,6 +6265,7 @@ function isDuplicateConflictError(error) {
               onRenameWindow={renameWindow}
               onDeleteWindow={deleteWindow}
               onChangeWindowColor={changeWindowColor}
+              onReorderWindows={reorderWindows}
               onSaveMemo={saveRightMemo}
               onRefresh={() => {
                 loadPlans(session?.user?.id)
@@ -4901,6 +6291,7 @@ function isDuplicateConflictError(error) {
               onRenameWindow={renameWindow}
               onDeleteWindow={deleteWindow}
               onChangeWindowColor={changeWindowColor}
+              onReorderWindows={reorderWindows}
               holidaysByDate={holidaysByDate}
               ensureHolidayYear={ensureHolidayYear}
               onAddPlan={openNewPlan}
@@ -5363,7 +6754,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 4,
     paddingVertical: 0,
-    paddingHorizontal: 1
+    paddingHorizontal: 1,
+    position: "relative"
   },
   tabScroll: {
     maxHeight: 42
@@ -5600,6 +6992,29 @@ const styles = StyleSheet.create({
   },
   tabPillActiveDark: {
     backgroundColor: DARK_SURFACE_2
+  },
+  tabPillGhost: {
+    backgroundColor: "#ffffff",
+    borderColor: "#cbd5e1",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.18,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 5
+  },
+  tabPillGhostDark: {
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: DARK_BORDER,
+    shadowOpacity: 0,
+    elevation: 0
+  },
+  tabPillPlaceholder: {
+    opacity: 0
+  },
+  tabDragOverlay: {
+    position: "absolute",
+    top: 0,
+    zIndex: 20
   },
   tabText: {
     fontSize: 13,
@@ -6729,6 +8144,183 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: "#0f172a"
   },
+  reorderCard: {
+    width: "92%",
+    alignSelf: "center",
+    maxWidth: 560,
+    maxHeight: "86%",
+    backgroundColor: "#ffffff",
+    borderRadius: 16,
+    padding: 16,
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.16,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 8
+  },
+  reorderCardDark: {
+    backgroundColor: DARK_SURFACE,
+    borderWidth: 1,
+    borderColor: DARK_BORDER,
+    shadowOpacity: 0,
+    elevation: 0
+  },
+  reorderInlineCard: {
+    marginTop: 6,
+    marginBottom: 4,
+    borderRadius: 14,
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    padding: 12
+  },
+  reorderInlineCardDark: {
+    backgroundColor: DARK_SURFACE,
+    borderColor: DARK_BORDER
+  },
+  reorderInlineHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    marginBottom: 6
+  },
+  reorderInlineTitle: {
+    fontSize: 14,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  reorderInlineHint: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#64748b",
+    marginBottom: 6
+  },
+  reorderHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 8
+  },
+  reorderHeaderTitle: {
+    fontSize: 16,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  reorderHeaderActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  reorderHeaderBtn: {
+    height: 30,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: "#f1f5f9",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  reorderHeaderBtnDark: {
+    backgroundColor: "rgba(255, 255, 255, 0.06)"
+  },
+  reorderHeaderBtnText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#334155"
+  },
+  reorderHeaderBtnPrimary: {
+    backgroundColor: ACCENT_BLUE
+  },
+  reorderHeaderBtnPrimaryText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#ffffff"
+  },
+  reorderDateText: {
+    marginTop: 4,
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#64748b"
+  },
+  reorderScroll: {
+    flex: 1
+  },
+  reorderScrollContent: {
+    paddingBottom: 10
+  },
+  reorderSection: {
+    marginTop: 10
+  },
+  reorderSectionTitle: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#334155",
+    marginBottom: 8
+  },
+  reorderNoTimeList: {
+    position: "relative"
+  },
+  reorderItemRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 9,
+    paddingHorizontal: 8,
+    gap: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: "#eef2f7"
+  },
+  reorderItemRowDark: {
+    borderBottomColor: DARK_BORDER_SOFT
+  },
+  reorderItemPlaceholder: {
+    opacity: 0
+  },
+  reorderDragOverlay: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    zIndex: 20
+  },
+  reorderDragGhost: {
+    backgroundColor: "#ffffff",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.18,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 6
+  },
+  reorderDragGhostDark: {
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: DARK_BORDER,
+    shadowOpacity: 0,
+    elevation: 0
+  },
+  reorderHandle: {
+    width: 28,
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 6
+  },
+  reorderHandleText: {
+    fontSize: 16,
+    fontWeight: "900",
+    color: "#94a3b8"
+  },
+  reorderHandleTextDark: {
+    color: DARK_MUTED
+  },
+  reorderEmpty: {
+    paddingVertical: 12,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  reorderEmptyText: {
+    fontSize: 12,
+    color: "#64748b"
+  },
   calendarFilterCard: {
     width: "90%",
     maxWidth: 460,
@@ -7111,6 +8703,9 @@ const styles = StyleSheet.create({
   editorPickerRowDark: {
     backgroundColor: DARK_SURFACE_2,
     borderColor: DARK_BORDER
+  },
+  editorRangeRow: {
+    marginTop: 8
   },
   editorPickerLeft: {
     flexDirection: "row",
