@@ -552,13 +552,6 @@ function parseMemoSections(text) {
   return sections
 }
 
-function timeToMinutes(value) {
-  const { startTime } = parseTimeSpanInput(value)
-  const match = String(startTime).match(/^(\d{2}):(\d{2})$/)
-  if (!match) return Number.MAX_SAFE_INTEGER
-  return Number(match[1]) * 60 + Number(match[2])
-}
-
 function parseSortOrderValue(value) {
   if (value == null) return null
   if (typeof value === "string") {
@@ -585,27 +578,18 @@ function parseTimestampMs(value) {
 function sortItemsByTimeAndOrder(items) {
   const list = Array.isArray(items) ? items : []
   if (list.length <= 1) return list
-  const timed = []
-  const noTime = []
-  for (const row of list) {
-    const minutes = timeToMinutes(row?.time)
-    if (minutes !== Number.MAX_SAFE_INTEGER) timed.push({ row, minutes })
-    else noTime.push(row)
-  }
-  timed.sort((a, b) => a.minutes - b.minutes)
-
-  const noTimeMeta = noTime.map((row, idx) => {
+  const meta = list.map((row, idx) => {
     const sortOrder = parseSortOrderValue(row?.sort_order ?? row?.sortOrder ?? row?.order)
     const createdAtMs = parseTimestampMs(row?.created_at ?? row?.createdAt)
     const updatedAtMs = parseTimestampMs(row?.updated_at ?? row?.updatedAt)
     const id = row?.id != null ? String(row.id) : ""
     return { row, sortOrder, createdAtMs, updatedAtMs, id, idx }
   })
-  const hasSortOrder = noTimeMeta.some((item) => item.sortOrder != null)
-  const hasFallbackOrder = noTimeMeta.some((item) => item.createdAtMs != null || item.updatedAtMs != null)
-  let noTimeSorted = noTime
-  if (hasSortOrder) {
-    noTimeSorted = [...noTimeMeta].sort((a, b) => {
+  const hasSortOrder = meta.some((item) => item.sortOrder != null)
+  const hasFallbackOrder = meta.some((item) => item.createdAtMs != null || item.updatedAtMs != null)
+  if (hasSortOrder || hasFallbackOrder) {
+    return [...meta]
+      .sort((a, b) => {
       const oa = a.sortOrder
       const ob = b.sortOrder
       if (!(oa == null && ob == null)) {
@@ -631,31 +615,10 @@ function sortItemsByTimeAndOrder(items) {
       if (a.id && !b.id) return -1
       if (!a.id && b.id) return 1
       return a.idx - b.idx
-    }).map((entry) => entry.row)
-  } else if (hasFallbackOrder) {
-    noTimeSorted = [...noTimeMeta].sort((a, b) => {
-      const ca = a.createdAtMs
-      const cb = b.createdAtMs
-      if (ca != null || cb != null) {
-        if (ca == null) return 1
-        if (cb == null) return -1
-        if (ca !== cb) return ca - cb
-      }
-      const ua = a.updatedAtMs
-      const ub = b.updatedAtMs
-      if (ua != null || ub != null) {
-        if (ua == null) return 1
-        if (ub == null) return -1
-        if (ua !== ub) return ua - ub
-      }
-      if (a.id && b.id && a.id !== b.id) return a.id.localeCompare(b.id, "en")
-      if (a.id && !b.id) return -1
-      if (!a.id && b.id) return 1
-      return a.idx - b.idx
-    }).map((entry) => entry.row)
+      })
+      .map((entry) => entry.row)
   }
-
-  return [...timed.map((entry) => entry.row), ...noTimeSorted]
+  return list
 }
 
 function diffDays(a, b) {
@@ -1720,7 +1683,6 @@ function ListScreen({
     [allItemsByDate, sections]
   )
 
-  const hasTimeText = useCallback((item) => Boolean(normalizePlanTimeRange(item).time), [])
   function moveItem(list, fromIndex, toIndex) {
     const safe = Array.isArray(list) ? list : []
     const next = [...safe]
@@ -1746,11 +1708,10 @@ function ListScreen({
     const key = String(dateKey ?? "").trim()
     if (!key) return
     const items = getAllItemsForDate(key)
-    const noTimeItems = items.filter((item) => !hasTimeText(item))
     setReorderState({ visible: true, dateKey: key })
-    setReorderItems(noTimeItems)
-    reorderItemsRef.current = noTimeItems
-    reorderOriginalIdsRef.current = noTimeItems
+    setReorderItems(items)
+    reorderItemsRef.current = items
+    reorderOriginalIdsRef.current = items
       .map((item) => String(item?.id ?? "").trim())
       .filter(Boolean)
     noTimeLayoutsRef.current = {}
@@ -2026,13 +1987,9 @@ function ListScreen({
         const key = String(section?.title ?? "")
         const baseData = applyListFilter(section?.data ?? [])
         if (activeKey && key === activeKey) {
-          const timedItems = baseData.filter((item) => hasTimeText(item))
           return {
             ...section,
-            data: [
-              ...timedItems,
-              { id: `__reorder__-${key}`, __reorder: true, date: key }
-            ]
+            data: [{ id: `__reorder__-${key}`, __reorder: true, date: key }]
           }
         }
         return {
@@ -2041,7 +1998,7 @@ function ListScreen({
         }
       })
       .filter((section) => (section?.data?.length ?? 0) > 0)
-  }, [sections, viewYear, viewMonth, applyListFilter, reorderState, hasTimeText])
+  }, [sections, viewYear, viewMonth, applyListFilter, reorderState])
 
   const reorderDow = reorderState.dateKey ? weekdayLabel(reorderState.dateKey) : ""
   const reorderDateLabel = reorderState.dateKey
@@ -2231,7 +2188,7 @@ function ListScreen({
                     ) : (
                       <View style={styles.reorderEmpty}>
                         <Text style={[styles.reorderEmptyText, isDark ? styles.textMutedDark : null]}>
-                          시간 없는 일정이 없습니다.
+                          항목이 없습니다.
                         </Text>
                       </View>
                     )}
@@ -2250,7 +2207,7 @@ function ListScreen({
             const isGeneral = !category || category === "__general__"
             const categoryColor = colorByTitle.get(category) || "#94a3b8"
             const dateKey = String(section?.title ?? item?.date ?? "")
-            const canReorder = !time && Boolean(onReorderNoTime)
+            const canReorder = Boolean(onReorderNoTime)
             const handlePress = () => {
               if (suppressPressRef.current) {
                 suppressPressRef.current = false
@@ -4977,13 +4934,41 @@ function AppInner() {
   async function loadPlans(userId) {
     if (!supabase || !userId) return
     setLoading(true)
-    const { data, error } = await supabase
-      .from("plans")
-      .select("*")
-      .eq("user_id", userId)
-      .is("deleted_at", null)
-      .order("date", { ascending: true })
-      .order("time", { ascending: true })
+    let data = null
+    let error = null
+    if (sortOrderSupportedRef.current) {
+      const ordered = await supabase
+        .from("plans")
+        .select("*")
+        .eq("user_id", userId)
+        .is("deleted_at", null)
+        .order("date", { ascending: true })
+        .order("sort_order", { ascending: true })
+      data = ordered.data
+      error = ordered.error
+      if (error && isSortOrderColumnError(error)) {
+        markSortOrderFallbackNotice()
+        const fallback = await supabase
+          .from("plans")
+          .select("*")
+          .eq("user_id", userId)
+          .is("deleted_at", null)
+          .order("date", { ascending: true })
+          .order("time", { ascending: true })
+        data = fallback.data
+        error = fallback.error
+      }
+    } else {
+      const fallback = await supabase
+        .from("plans")
+        .select("*")
+        .eq("user_id", userId)
+        .is("deleted_at", null)
+        .order("date", { ascending: true })
+        .order("time", { ascending: true })
+      data = fallback.data
+      error = fallback.error
+    }
     if (error) {
       setAuthMessage(error.message || "Load failed.")
       setPlans([])
