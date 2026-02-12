@@ -14,6 +14,7 @@ import {
   LayoutAnimation,
   Image,
   Modal,
+  NativeModules,
   PanResponder,
   Platform,
   Pressable,
@@ -82,6 +83,7 @@ const supabase =
     : null
 
 const Tab = createBottomTabNavigator()
+const plannerWidgetModule = Platform.OS === "android" ? NativeModules?.PlannerWidgetModule : null
 
 const DEFAULT_WINDOWS = [{ id: "all", title: "통합", color: ACCENT_BLUE, fixed: true }]
 const AUTH_STORAGE_KEY = "plannerMobile.auth.v1"
@@ -112,6 +114,18 @@ function pad2(value) {
 
 function dateToKey(year, month, day) {
   return `${year}-${pad2(month)}-${pad2(day)}`
+}
+
+function clamp(value, min, max) {
+  const n = Number(value)
+  const lo = Number(min)
+  const hi = Number(max)
+  if (!Number.isFinite(n)) return Number.isFinite(lo) ? lo : 0
+  if (!Number.isFinite(lo) && !Number.isFinite(hi)) return n
+  if (!Number.isFinite(lo)) return n > hi ? hi : n
+  if (!Number.isFinite(hi)) return n < lo ? lo : n
+  if (lo > hi) return n < hi ? hi : n > lo ? lo : n
+  return n < lo ? lo : n > hi ? hi : n
 }
 
 function parseDateKey(dateKey) {
@@ -520,6 +534,156 @@ function formatLine(item) {
   const time = buildPlanTimeTextFromRow(item)
   const text = String(item?.content ?? "").trim()
   return { time, text }
+}
+
+function splitTimeLabel(value) {
+  const raw = String(value ?? "").trim()
+  if (!raw) return { start: "", end: "" }
+  const rangeMatch = raw.match(/^(\d{1,2}:\d{2})\s*[~\-–—]\s*(\d{1,2}:\d{2})$/)
+  if (rangeMatch) {
+    const start = normalizeClockTime(rangeMatch[1])
+    const end = normalizeClockTime(rangeMatch[2])
+    if (start && end && start !== end) return { start, end }
+    return { start: start || raw, end: "" }
+  }
+  const spaceMatch = raw.match(/^(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})$/)
+  if (spaceMatch) {
+    const start = normalizeClockTime(spaceMatch[1])
+    const end = normalizeClockTime(spaceMatch[2])
+    if (start && end && start !== end) return { start, end }
+    return { start: start || raw, end: "" }
+  }
+  return { start: raw, end: "" }
+}
+
+function buildWidgetLineText(row) {
+  const content = String(row?.content ?? "").trim()
+  if (!content) return ""
+  const category = String(row?.category_id ?? "").trim()
+  if (!category || category === "__general__") return content
+  return `[${category}] ${content}`
+}
+
+function buildWidgetCalendarText(row) {
+  const content = String(row?.content ?? "").trim()
+  if (!content) return ""
+  const time = buildPlanTimeTextFromRow(row)
+  return [time, content].filter(Boolean).join(" ").trim()
+}
+
+function buildWidgetDayHeaderLabel(dateKey, todayKey) {
+  const dt = parseDateKey(dateKey)
+  if (!dt) return String(dateKey ?? "")
+  const base = `${dt.getMonth() + 1}/${dt.getDate()} (${weekdayLabel(dateKey)})`
+  if (dateKey === todayKey) return `오늘 ${base}`
+  return base
+}
+
+function buildWeekWidgetPayload(allPlans, startDateKey) {
+  const parsedStart = parseDateKey(startDateKey)
+  const startDate = parsedStart ? dateFromDate(parsedStart) : dateFromDate(new Date())
+  const todayKey = dateKeyFromDate(startDate)
+  const rows = []
+
+  for (let i = 0; i < 5; i += 1) {
+    const day = addDays(startDate, i)
+    const dateKey = dateKeyFromDate(day)
+    rows.push({
+      type: "header",
+      text: buildWidgetDayHeaderLabel(dateKey, todayKey)
+    })
+
+    const items = sortItemsByTimeAndOrder(
+      (allPlans ?? []).filter((row) => {
+        if (!row || row?.deleted_at) return false
+        if (String(row?.date ?? "").trim() !== dateKey) return false
+        return Boolean(String(row?.content ?? "").trim())
+      })
+    )
+
+    if (items.length === 0) continue
+    for (const row of items) {
+      const text = buildWidgetLineText(row)
+      const time = buildPlanTimeTextFromRow(row)
+      if (!time && !text) continue
+      rows.push({ type: "item", time, text })
+    }
+  }
+
+  return {
+    rows,
+    emptyText: "오늘 포함 5일 내 일정이 없습니다."
+  }
+}
+
+function buildCalendarWidgetPayload(allPlans, anchorDateKey) {
+  const parsedAnchor = parseDateKey(anchorDateKey)
+  const anchor = parsedAnchor ? dateFromDate(parsedAnchor) : dateFromDate(new Date())
+  const now = dateFromDate(new Date())
+  const grouped = new Map()
+  for (const row of allPlans ?? []) {
+    if (!row || row?.deleted_at) continue
+    const key = String(row?.date ?? "").trim()
+    if (!parseDateKey(key)) continue
+    if (!String(row?.content ?? "").trim()) continue
+    const bucket = grouped.get(key) ?? []
+    bucket.push(row)
+    grouped.set(key, bucket)
+  }
+
+  const itemsByDate = {}
+  for (const [key, rows] of grouped.entries()) {
+    const lines = sortItemsByTimeAndOrder(rows)
+      .map((row) => buildWidgetCalendarText(row))
+      .filter(Boolean)
+    if (lines.length > 0) {
+      itemsByDate[key] = lines
+    }
+  }
+
+  return {
+    title: `${anchor.getMonth() + 1}월`,
+    anchorDateKey: dateKeyFromDate(anchor),
+    todayKey: dateKeyFromDate(now),
+    itemsByDate,
+    emptyText: "표시할 일정이 없습니다."
+  }
+}
+
+function buildWidgetsPayload(allPlans, todayKey) {
+  return {
+    list: buildWeekWidgetPayload(allPlans, todayKey),
+    calendar: buildCalendarWidgetPayload(allPlans, todayKey),
+    updatedAt: new Date().toISOString()
+  }
+}
+
+async function syncAndroidWidgetPayload(payload) {
+  if (Platform.OS !== "android") return
+  if (!plannerWidgetModule || typeof plannerWidgetModule.setPayload !== "function") return
+  try {
+    await plannerWidgetModule.setPayload(JSON.stringify(payload ?? {}))
+  } catch (_e) {
+    // ignore
+  }
+}
+
+function runSwapLayoutAnimation() {
+  if (Platform.OS === "web") return
+  LayoutAnimation.configureNext({
+    duration: 90,
+    create: {
+      type: LayoutAnimation.Types.easeInEaseOut,
+      property: LayoutAnimation.Properties.opacity
+    },
+    update: {
+      type: LayoutAnimation.Types.easeInEaseOut
+    },
+    delete: {
+      type: LayoutAnimation.Types.easeInEaseOut,
+      property: LayoutAnimation.Properties.opacity
+    }
+  })
 }
 
 function isRenderablePlanRow(row) {
@@ -1592,7 +1756,8 @@ function ListScreen({
   ensureHolidayYear,
   onAddPlan,
   onEditPlan,
-  onReorderNoTime
+  onReorderNoTime,
+  onQuickDeletePlan
 }) {
   const scale = useMemo(() => {
     const n = Number(fontScale)
@@ -1630,7 +1795,7 @@ function ListScreen({
   const [draggingId, setDraggingId] = useState(null)
   const dragY = useRef(new Animated.Value(0)).current
   const noTimeLayoutsRef = useRef({})
-  const dragStateRef = useRef({ activeId: null, startY: 0, height: 0, currentIndex: -1, lastSwapAt: 0 })
+  const dragStateRef = useRef({ activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 })
   const pendingAutoDragIdRef = useRef("")
   const suppressPressRef = useRef(false)
 
@@ -1703,11 +1868,12 @@ function ListScreen({
     return true
   }
 
-  function openReorderModal(dateKey) {
+  function openReorderModal(dateKey, sourceItems = null) {
     if (!onReorderNoTime) return
     const key = String(dateKey ?? "").trim()
     if (!key) return
-    const items = getAllItemsForDate(key)
+    const rawItems = Array.isArray(sourceItems) ? sourceItems : getAllItemsForDate(key)
+    const items = sortItemsByTimeAndOrder(rawItems)
     setReorderState({ visible: true, dateKey: key })
     setReorderItems(items)
     reorderItemsRef.current = items
@@ -1715,7 +1881,7 @@ function ListScreen({
       .map((item) => String(item?.id ?? "").trim())
       .filter(Boolean)
     noTimeLayoutsRef.current = {}
-    dragStateRef.current = { activeId: null, startY: 0, height: 0, currentIndex: -1, lastSwapAt: 0 }
+    dragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
     setDraggingId(null)
     setReorderSaving(false)
     dragY.setValue(0)
@@ -1727,7 +1893,7 @@ function ListScreen({
     reorderItemsRef.current = []
     reorderOriginalIdsRef.current = []
     noTimeLayoutsRef.current = {}
-    dragStateRef.current = { activeId: null, startY: 0, height: 0, currentIndex: -1, lastSwapAt: 0 }
+    dragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
     pendingAutoDragIdRef.current = ""
     setDraggingId(null)
     setReorderSaving(false)
@@ -1746,7 +1912,7 @@ function ListScreen({
     if (currentIndex < 0) return
     const startY = Number(layout.y) || 0
     const height = Number(layout.height) || 48
-    dragStateRef.current = { activeId: id, startY, height, currentIndex, lastSwapAt: 0 }
+    dragStateRef.current = { activeId: id, startY, height, startIndex: currentIndex, currentIndex, lastSwapAt: 0 }
     dragY.setValue(startY)
     requestAnimationFrame(() => {
       setDraggingId(id)
@@ -1758,34 +1924,23 @@ function ListScreen({
     if (!state.activeId) return
     const activeId = String(state.activeId ?? "")
     const cleanup = () => {
-      dragStateRef.current = { activeId: null, startY: 0, height: 0, currentIndex: -1, lastSwapAt: 0 }
+      dragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
       setDraggingId(null)
-      requestAnimationFrame(() => {
-        dragY.setValue(0)
-      })
     }
 
     dragY.stopAnimation((currentY) => {
       const rawTarget = Number(noTimeLayoutsRef.current?.[activeId]?.y ?? Number.NaN)
       const fallback = Number.isFinite(currentY) ? currentY : Number(state.startY ?? 0)
       const targetY = Number.isFinite(rawTarget) ? rawTarget : fallback
-      Animated.timing(dragY, {
+      Animated.spring(dragY, {
         toValue: targetY,
-        duration: 90,
-        useNativeDriver: false
-      }).start(() => cleanup())
+        tension: 220,
+        friction: 22,
+        useNativeDriver: true
+      }).start(() => {
+        cleanup()
+      })
     })
-  }
-
-  function getReorderRowMidpoint(id) {
-    const key = String(id ?? "").trim()
-    if (!key) return null
-    const layout = noTimeLayoutsRef.current?.[key]
-    if (!layout) return null
-    const y = Number(layout.y ?? 0)
-    const height = Number(layout.height ?? 0)
-    if (!Number.isFinite(y) || !Number.isFinite(height) || height <= 0) return null
-    return y + height / 2
   }
 
   const panResponder = useMemo(
@@ -1808,32 +1963,17 @@ function ListScreen({
           }
           if (currentIndex < 0) return
           const now = Date.now()
-          if (now - Number(state.lastSwapAt ?? 0) < 60) return
-          const centerY = nextY + Number(state.height ?? 0) / 2
-          const deadZone = Math.max(8, Math.min(18, Number(state.height ?? 0) * 0.15))
-          let targetIndex = currentIndex
-
-          while (targetIndex < list.length - 1) {
-            const rightId = String(list[targetIndex + 1]?.id ?? "")
-            const rightMid = getReorderRowMidpoint(rightId)
-            if (!Number.isFinite(rightMid)) break
-            if (centerY > rightMid + deadZone) targetIndex += 1
-            else break
-          }
-
-          while (targetIndex > 0) {
-            const leftId = String(list[targetIndex - 1]?.id ?? "")
-            const leftMid = getReorderRowMidpoint(leftId)
-            if (!Number.isFinite(leftMid)) break
-            if (centerY < leftMid - deadZone) targetIndex -= 1
-            else break
-          }
-
+          if (now - Number(state.lastSwapAt ?? 0) < 16) return
+          const startIndex = Number.isFinite(Number(state.startIndex))
+            ? Number(state.startIndex)
+            : currentIndex
+          const rowHeight = Math.max(28, Number(state.height ?? 0) || 48)
+          const stepOffset = Number(gesture?.dy ?? 0) / rowHeight
+          const projected = Math.round(startIndex + stepOffset)
+          const targetIndex = clamp(projected, 0, list.length - 1)
           if (targetIndex === currentIndex) return
           const nextItems = moveItem(list, currentIndex, targetIndex)
-          if (Platform.OS !== "web") {
-            LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut)
-          }
+          runSwapLayoutAnimation()
           reorderItemsRef.current = nextItems
           dragStateRef.current = { ...state, currentIndex: targetIndex, lastSwapAt: now }
           setReorderItems(nextItems)
@@ -1864,20 +2004,47 @@ function ListScreen({
     const dateKey = String(reorderState?.dateKey ?? "").trim()
     const list = Array.isArray(reorderItemsRef.current) ? reorderItemsRef.current : []
     const nextIds = list.map((item) => String(item?.id ?? "").trim()).filter(Boolean)
-    if (!dateKey || nextIds.length === 0) {
-      closeReorderModal()
-      return
-    }
-    if (idsEqual(nextIds, reorderOriginalIdsRef.current)) {
-      closeReorderModal()
-      return
-    }
+    if (!dateKey || nextIds.length === 0) return
+    if (idsEqual(nextIds, reorderOriginalIdsRef.current)) return
     setReorderSaving(true)
     try {
       await onReorderNoTime?.(dateKey, list)
+      reorderOriginalIdsRef.current = nextIds
     } finally {
-      closeReorderModal()
+      setReorderSaving(false)
     }
+  }
+
+  async function closeReorderModalWithSave() {
+    if (reorderSaving) return
+    await commitReorder()
+    closeReorderModal()
+  }
+
+  function quickDeleteFromReorder(item) {
+    if (!item || !onQuickDeletePlan) return
+    Alert.alert("일정 삭제", "이 항목을 삭제할까요?", [
+      { text: "취소", style: "cancel" },
+      {
+        text: "삭제",
+        style: "destructive",
+        onPress: async () => {
+          await onQuickDeletePlan?.(item)
+          const id = String(item?.id ?? "").trim()
+          if (!id) return
+          const next = (reorderItemsRef.current ?? []).filter((row) => String(row?.id ?? "").trim() !== id)
+          reorderItemsRef.current = next
+          reorderOriginalIdsRef.current = next.map((row) => String(row?.id ?? "").trim()).filter(Boolean)
+          setReorderItems(next)
+          if (draggingId && String(draggingId) === id) {
+            dragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
+            setDraggingId(null)
+            dragY.setValue(0)
+          }
+          if (next.length === 0) closeReorderModal()
+        }
+      }
+    ])
   }
 
   function scrollToToday() {
@@ -1943,7 +2110,6 @@ function ListScreen({
     setViewMonth(today.getMonth() + 1)
     pendingScrollRef.current = true
     setScrollToken((prev) => prev + 1)
-    onAddPlan?.(todayKey)
     setTimeout(() => {
       if (!scrollToToday()) return
     }, 80)
@@ -2008,7 +2174,7 @@ function ListScreen({
 
   function renderReorderRow(item, options = {}) {
     if (!item) return null
-    const { draggable = false, ghost = false, placeholder = false, onLayout, onLongPress, rowKey } = options
+    const { draggable = false, ghost = false, placeholder = false, onLayout, onLongPress, onDelete, rowKey } = options
     const time = buildPlanTimeTextFromRow(item)
     const content = String(item?.content ?? "").trim()
     const category = String(item?.category_id ?? "").trim()
@@ -2020,7 +2186,7 @@ function ListScreen({
         key={rowKey}
         onLayout={onLayout}
         onLongPress={draggable && !ghost ? onLongPress : undefined}
-        delayLongPress={draggable && !ghost ? 180 : undefined}
+        delayLongPress={draggable && !ghost ? 110 : undefined}
         style={[
           styles.reorderItemRow,
           isDark ? styles.reorderItemRowDark : null,
@@ -2059,6 +2225,15 @@ function ListScreen({
             ) : null}
           </View>
         </View>
+        {draggable && !ghost && !placeholder ? (
+          <Pressable
+            onPress={onDelete}
+            hitSlop={8}
+            style={[styles.reorderDeleteBtn, isDark ? styles.reorderDeleteBtnDark : null]}
+          >
+            <Text style={styles.reorderDeleteBtnText}>X</Text>
+          </Pressable>
+        ) : null}
       </Container>
     )
   }
@@ -2136,36 +2311,6 @@ function ListScreen({
             if (item?.__reorder) {
               return (
                 <View style={[styles.reorderInlineCard, isDark ? styles.reorderInlineCardDark : null]}>
-                  <View style={styles.reorderInlineHeader}>
-                    <View>
-                      {reorderDateLabel ? (
-                        <Text style={[styles.reorderInlineTitle, isDark ? styles.textDark : null]}>
-                          {reorderDateLabel}
-                        </Text>
-                      ) : null}
-                    </View>
-                    <View style={styles.reorderHeaderActions}>
-                      <Pressable
-                        onPress={closeReorderModal}
-                        style={[styles.reorderHeaderBtn, isDark ? styles.reorderHeaderBtnDark : null]}
-                        disabled={reorderSaving}
-                      >
-                        <Text style={[styles.reorderHeaderBtnText, isDark ? styles.textMutedDark : null]}>취소</Text>
-                      </Pressable>
-                      <Pressable
-                        onPress={commitReorder}
-                        style={[styles.reorderHeaderBtn, styles.reorderHeaderBtnPrimary]}
-                        disabled={reorderSaving}
-                      >
-                        <Text style={styles.reorderHeaderBtnPrimaryText}>
-                          {reorderSaving ? "저장 중..." : "저장"}
-                        </Text>
-                      </Pressable>
-                    </View>
-                  </View>
-                  <Text style={[styles.reorderInlineHint, isDark ? styles.textMutedDark : null]}>
-                    항목을 길게 눌러 드래그
-                  </Text>
                   <View style={styles.reorderNoTimeList} {...panResponder.panHandlers}>
                     {reorderItems.length ? (
                       reorderItems.map((row) => {
@@ -2182,7 +2327,8 @@ function ListScreen({
                             if (!layout) return
                             noTimeLayoutsRef.current[rowId] = { y: layout.y, height: layout.height }
                           },
-                          onLongPress: () => startDrag(row)
+                          onLongPress: () => startDrag(row),
+                          onDelete: () => quickDeleteFromReorder(row)
                         })
                       })
                     ) : (
@@ -2193,7 +2339,10 @@ function ListScreen({
                       </View>
                     )}
                     {draggingItem ? (
-                      <Animated.View pointerEvents="none" style={[styles.reorderDragOverlay, { top: dragY }]}>
+                      <Animated.View
+                        pointerEvents="none"
+                        style={[styles.reorderDragOverlay, { transform: [{ translateY: dragY }] }]}
+                      >
                         {renderReorderRow(draggingItem, { ghost: true })}
                       </Animated.View>
                     ) : null}
@@ -2219,14 +2368,14 @@ function ListScreen({
               if (!canReorder) return
               suppressPressRef.current = true
               pendingAutoDragIdRef.current = String(item?.id ?? "").trim()
-              openReorderModal(dateKey)
+              openReorderModal(dateKey, section?.data ?? [])
             }
             return (
               <Pressable
                 style={[styles.itemRow, isDark ? styles.itemRowDark : null]}
                 onPress={handlePress}
                 onLongPress={canReorder ? handleLongPress : undefined}
-                delayLongPress={220}
+                delayLongPress={120}
               >
                 <View style={styles.itemLeftCol}>
                   <Text
@@ -2264,18 +2413,25 @@ function ListScreen({
           renderSectionHeader={({ section }) => {
 	            const key = String(section.title ?? "")
               const isTodaySection = key === todayKey
+              const isReorderSection = reorderState.visible && String(reorderState.dateKey ?? "") === key
 	            const holidayName = holidaysByDate?.get?.(key) ?? ""
 	            const isHoliday = Boolean(holidayName)
 	            const color = weekdayColor(key, { isHoliday, isDark })
 	            const dow = weekdayLabel(key)
 	            return (
 	              <Pressable
-	                style={[
+                style={[
                   styles.sectionHeader,
                   isDark ? styles.sectionHeaderDark : null,
                   isTodaySection ? (isDark ? styles.sectionHeaderTodayDark : styles.sectionHeaderToday) : null
                 ]}
-                onPress={() => onAddPlan?.(key)}
+                onPress={() => {
+                  if (isReorderSection) {
+                    closeReorderModalWithSave()
+                    return
+                  }
+                  onAddPlan?.(key)
+                }}
               >
 	                <View style={styles.sectionHeaderRow}>
 	                  <View style={styles.sectionHeaderLeft}>
@@ -2305,6 +2461,18 @@ function ListScreen({
                           {holidayName}
                         </Text>
                       </View>
+                    ) : null}
+                    {isReorderSection ? (
+                      <Pressable
+                        onPress={(event) => {
+                          event?.stopPropagation?.()
+                          closeReorderModalWithSave()
+                        }}
+                        hitSlop={8}
+                        style={[styles.sectionHeaderDoneBtn, isDark ? styles.sectionHeaderDoneBtnDark : null]}
+                      >
+                        <Text style={styles.sectionHeaderDoneBtnText}>완료</Text>
+                      </Pressable>
                     ) : null}
                   </View>
                 </View>
@@ -3894,6 +4062,8 @@ function CalendarScreen({
   ensureHolidayYear,
   onAddPlan,
   onEditPlan,
+  onReorderNoTime,
+  onQuickDeletePlan,
   onSelectDateKey
 }) {
   const isDark = tone === "dark"
@@ -3904,6 +4074,17 @@ function CalendarScreen({
   const [calendarFilterVisible, setCalendarFilterVisible] = useState(false)
   const [calendarFilterTitles, setCalendarFilterTitles] = useState([])
   const filterInitRef = useRef(false)
+  const [dayReorderMode, setDayReorderMode] = useState(false)
+  const [dayReorderItems, setDayReorderItems] = useState([])
+  const dayReorderItemsRef = useRef([])
+  const dayReorderOriginalIdsRef = useRef([])
+  const [dayReorderSaving, setDayReorderSaving] = useState(false)
+  const [dayDraggingId, setDayDraggingId] = useState(null)
+  const dayDragY = useRef(new Animated.Value(0)).current
+  const dayLayoutsRef = useRef({})
+  const dayDragStateRef = useRef({ activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 })
+  const dayPendingAutoDragIdRef = useRef("")
+  const daySuppressPressRef = useRef(false)
 
   const colorByTitle = useMemo(() => {
     const map = new Map()
@@ -3962,6 +4143,248 @@ function CalendarScreen({
     const [y, m, d] = String(selectedDateKey).split("-")
     return `${y}.${m}.${d}${dayName ? ` (${dayName})` : ""}`
   }, [selectedDateKey])
+  const dayModalCount = dayReorderMode ? dayReorderItems.length : dayItems.length
+  const dayDraggingItem = dayReorderItems.find((item) => String(item?.id ?? "") === dayDraggingId)
+
+  function moveDayItem(list, fromIndex, toIndex) {
+    const safe = Array.isArray(list) ? list : []
+    const next = [...safe]
+    if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return next
+    if (fromIndex >= next.length || toIndex >= next.length) return next
+    const [moved] = next.splice(fromIndex, 1)
+    next.splice(toIndex, 0, moved)
+    return next
+  }
+
+  function dayIdsEqual(a, b) {
+    const left = Array.isArray(a) ? a : []
+    const right = Array.isArray(b) ? b : []
+    if (left.length !== right.length) return false
+    for (let i = 0; i < left.length; i += 1) {
+      if (left[i] !== right[i]) return false
+    }
+    return true
+  }
+
+  function hasPendingDayReorderChanges() {
+    const nextIds = (dayReorderItemsRef.current ?? []).map((item) => String(item?.id ?? "").trim()).filter(Boolean)
+    if (nextIds.length === 0) return false
+    return !dayIdsEqual(nextIds, dayReorderOriginalIdsRef.current)
+  }
+
+  async function commitDayReorderIfNeeded() {
+    if (dayReorderSaving) return
+    if (!onReorderNoTime) return
+    const dateKey = String(selectedDateKey ?? "").trim()
+    if (!dateKey) return
+    const list = Array.isArray(dayReorderItemsRef.current) ? [...dayReorderItemsRef.current] : []
+    const nextIds = list.map((item) => String(item?.id ?? "").trim()).filter(Boolean)
+    if (nextIds.length === 0) return
+    if (!hasPendingDayReorderChanges()) return
+    setDayReorderSaving(true)
+    try {
+      await onReorderNoTime?.(dateKey, list)
+      dayReorderOriginalIdsRef.current = nextIds
+    } finally {
+      setDayReorderSaving(false)
+    }
+  }
+
+  function closeDayReorderMode() {
+    setDayReorderMode(false)
+    dayLayoutsRef.current = {}
+    dayDragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
+    dayPendingAutoDragIdRef.current = ""
+    setDayDraggingId(null)
+    setDayReorderSaving(false)
+    daySuppressPressRef.current = false
+    dayDragY.setValue(0)
+  }
+
+  async function closeDayReorderModeWithSave() {
+    if (dayReorderSaving) return
+    await commitDayReorderIfNeeded()
+    closeDayReorderMode()
+  }
+
+  function clearDayReorderState() {
+    closeDayReorderMode()
+    setDayReorderItems([])
+    dayReorderItemsRef.current = []
+    dayReorderOriginalIdsRef.current = []
+  }
+
+  function openDayReorder(sourceItems = null, autoDragId = "") {
+    if (!onReorderNoTime) return
+    const dateKey = String(selectedDateKey ?? "").trim()
+    if (!dateKey) return
+    const rawItems = Array.isArray(sourceItems) ? sourceItems : dayItems
+    const items = sortItemsByTimeAndOrder(rawItems)
+    const ids = items.map((item) => String(item?.id ?? "").trim()).filter(Boolean)
+    if (ids.length === 0) return
+    setDayReorderMode(true)
+    setDayReorderItems(items)
+    dayReorderItemsRef.current = items
+    dayReorderOriginalIdsRef.current = ids
+    dayLayoutsRef.current = {}
+    dayDragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
+    dayPendingAutoDragIdRef.current = String(autoDragId ?? "").trim()
+    setDayDraggingId(null)
+    setDayReorderSaving(false)
+    dayDragY.setValue(0)
+  }
+
+  function startDayDrag(item) {
+    if (!item) return
+    const id = String(item?.id ?? "").trim()
+    if (!id) return
+    const layout = dayLayoutsRef.current?.[id]
+    if (!layout) return
+    const list = dayReorderItemsRef.current
+    const currentIndex = Array.isArray(list) ? list.findIndex((row) => String(row?.id ?? "").trim() === id) : -1
+    if (currentIndex < 0) return
+    const startY = Number(layout.y) || 0
+    const height = Number(layout.height) || 48
+    dayDragStateRef.current = { activeId: id, startY, height, startIndex: currentIndex, currentIndex, lastSwapAt: 0 }
+    dayDragY.setValue(startY)
+    requestAnimationFrame(() => {
+      setDayDraggingId(id)
+    })
+  }
+
+  function finishDayDrag() {
+    const state = dayDragStateRef.current
+    if (!state.activeId) return
+    const activeId = String(state.activeId ?? "")
+    const cleanup = () => {
+      dayDragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
+      setDayDraggingId(null)
+    }
+
+    dayDragY.stopAnimation((currentY) => {
+      const rawTarget = Number(dayLayoutsRef.current?.[activeId]?.y ?? Number.NaN)
+      const fallback = Number.isFinite(currentY) ? currentY : Number(state.startY ?? 0)
+      const targetY = Number.isFinite(rawTarget) ? rawTarget : fallback
+      Animated.spring(dayDragY, {
+        toValue: targetY,
+        tension: 220,
+        friction: 22,
+        useNativeDriver: true
+      }).start(() => {
+        cleanup()
+      })
+    })
+  }
+
+  function quickDeleteFromDayReorder(item) {
+    if (!item || !onQuickDeletePlan) return
+    Alert.alert("일정 삭제", "이 항목을 삭제할까요?", [
+      { text: "취소", style: "cancel" },
+      {
+        text: "삭제",
+        style: "destructive",
+        onPress: async () => {
+          await onQuickDeletePlan?.(item)
+          const id = String(item?.id ?? "").trim()
+          if (!id) return
+          const next = (dayReorderItemsRef.current ?? []).filter((row) => String(row?.id ?? "").trim() !== id)
+          dayReorderItemsRef.current = next
+          dayReorderOriginalIdsRef.current = next.map((row) => String(row?.id ?? "").trim()).filter(Boolean)
+          setDayReorderItems(next)
+          if (dayDraggingId && String(dayDraggingId) === id) {
+            dayDragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
+            setDayDraggingId(null)
+            dayDragY.setValue(0)
+          }
+          if (next.length === 0) closeDayReorderMode()
+        }
+      }
+    ])
+  }
+
+  const dayPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => Boolean(dayDragStateRef.current.activeId),
+        onStartShouldSetPanResponderCapture: () => Boolean(dayDragStateRef.current.activeId),
+        onMoveShouldSetPanResponder: () => Boolean(dayDragStateRef.current.activeId),
+        onMoveShouldSetPanResponderCapture: () => Boolean(dayDragStateRef.current.activeId),
+        onPanResponderMove: (_evt, gesture) => {
+          const state = dayDragStateRef.current
+          if (!state.activeId) return
+          const nextY = Number(state.startY ?? 0) + Number(gesture?.dy ?? 0)
+          dayDragY.setValue(nextY)
+          const list = dayReorderItemsRef.current
+          if (!Array.isArray(list) || list.length === 0) return
+          let currentIndex = Number(state.currentIndex ?? -1)
+          if (!Number.isFinite(currentIndex) || currentIndex < 0 || currentIndex >= list.length) {
+            currentIndex = list.findIndex((row) => String(row?.id ?? "") === String(state.activeId ?? ""))
+          }
+          if (currentIndex < 0) return
+          const now = Date.now()
+          if (now - Number(state.lastSwapAt ?? 0) < 16) return
+          const startIndex = Number.isFinite(Number(state.startIndex))
+            ? Number(state.startIndex)
+            : currentIndex
+          const rowHeight = Math.max(28, Number(state.height ?? 0) || 48)
+          const stepOffset = Number(gesture?.dy ?? 0) / rowHeight
+          const projected = Math.round(startIndex + stepOffset)
+          const targetIndex = clamp(projected, 0, list.length - 1)
+          if (targetIndex === currentIndex) return
+          const nextItems = moveDayItem(list, currentIndex, targetIndex)
+          runSwapLayoutAnimation()
+          dayReorderItemsRef.current = nextItems
+          dayDragStateRef.current = { ...state, currentIndex: targetIndex, lastSwapAt: now }
+          setDayReorderItems(nextItems)
+        },
+        onPanResponderRelease: () => finishDayDrag(),
+        onPanResponderTerminate: () => finishDayDrag(),
+        onPanResponderTerminationRequest: () => false
+      }),
+    [selectedDateKey, onReorderNoTime]
+  )
+
+  async function closeDayModal() {
+    if (dayReorderSaving) return
+    if (dayReorderMode) {
+      await commitDayReorderIfNeeded()
+    }
+    setSelectedDateKey(null)
+    clearDayReorderState()
+  }
+
+  useEffect(() => {
+    dayReorderItemsRef.current = dayReorderItems
+  }, [dayReorderItems])
+
+  useEffect(() => {
+    if (selectedDateKey) return
+    clearDayReorderState()
+  }, [selectedDateKey])
+
+  useEffect(() => {
+    if (!selectedDateKey || dayReorderMode) return
+    const sorted = sortItemsByTimeAndOrder(dayItems)
+    const nextIds = sorted.map((item) => String(item?.id ?? "").trim()).filter(Boolean)
+    const currentIds = (dayReorderItemsRef.current ?? []).map((item) => String(item?.id ?? "").trim()).filter(Boolean)
+    if (dayIdsEqual(nextIds, currentIds)) return
+    setDayReorderItems(sorted)
+    dayReorderItemsRef.current = sorted
+  }, [selectedDateKey, dayItems, dayReorderMode])
+
+  useEffect(() => {
+    if (!dayReorderMode) return
+    const pendingId = String(dayPendingAutoDragIdRef.current ?? "").trim()
+    if (!pendingId) return
+    const row = dayReorderItems.find((item) => String(item?.id ?? "").trim() === pendingId)
+    if (!row) {
+      dayPendingAutoDragIdRef.current = ""
+      return
+    }
+    if (!dayLayoutsRef.current?.[pendingId]) return
+    dayPendingAutoDragIdRef.current = ""
+    startDayDrag(row)
+  }, [dayReorderMode, dayReorderItems])
 
   useEffect(() => {
     ensureHolidayYear?.(viewYear)
@@ -4047,6 +4470,50 @@ function CalendarScreen({
       if (has) return prev.filter((v) => v !== key)
       return [...prev, key]
     })
+  }
+
+  function renderDayModalRow(item, options = {}) {
+    if (!item) return null
+    const { rowKey, onPress, onLongPress, onDelete, onLayout, draggable = false, ghost = false, placeholder = false } = options
+    const line = formatLine(item)
+    const time = buildPlanTimeTextFromRow(item)
+    const canLongPress = !ghost && typeof onLongPress === "function"
+    const canPress = !ghost && typeof onPress === "function"
+    const isPressable = canPress || canLongPress || (draggable && !ghost)
+    const showDelete = draggable && !ghost && !placeholder && typeof onDelete === "function"
+    const Container = isPressable ? Pressable : View
+    return (
+      <Container
+        key={rowKey}
+        onLayout={onLayout}
+        onPress={canPress ? onPress : undefined}
+        onLongPress={canLongPress ? onLongPress : undefined}
+        delayLongPress={canLongPress ? 110 : undefined}
+        style={[
+          styles.dayModalItemRow,
+          isDark ? styles.dayModalItemRowDark : null,
+          ghost ? styles.reorderDragGhost : null,
+          ghost && isDark ? styles.reorderDragGhostDark : null,
+          placeholder ? styles.reorderItemPlaceholder : null
+        ]}
+      >
+        {time ? (
+          <Text style={[styles.dayModalItemTime, isDark ? styles.textMutedDark : null]}>{time}</Text>
+        ) : (
+          <Text style={styles.dayModalItemTimeEmpty}>{"\u00A0"}</Text>
+        )}
+        <Text style={[styles.dayModalItemText, isDark ? styles.textDark : null]}>{line.text}</Text>
+        {showDelete ? (
+          <Pressable
+            onPress={onDelete}
+            hitSlop={8}
+            style={[styles.reorderDeleteBtn, isDark ? styles.reorderDeleteBtnDark : null]}
+          >
+            <Text style={styles.reorderDeleteBtnText}>X</Text>
+          </Pressable>
+        ) : null}
+      </Container>
+    )
   }
 
   const todayLabel = `${today.getMonth() + 1}/${today.getDate()}`
@@ -4189,6 +4656,8 @@ function CalendarScreen({
 	                <View style={styles.calendarLineStack}>
 	                  {visible.map((item) => {
 	                    const line = formatLine(item)
+                      const timeLabel = splitTimeLabel(line.time)
+                      const hasRangeTime = Boolean(timeLabel.end)
 	                    const category = String(item?.category_id ?? "").trim()
 	                    const dotColor =
 	                      category && category !== "__general__"
@@ -4199,17 +4668,46 @@ function CalendarScreen({
 	                        <View
 	                          style={[
 	                            styles.calendarLabel,
+                              hasRangeTime ? styles.calendarLabelRange : null,
 	                            { backgroundColor: dotColor },
 	                            isDark ? styles.calendarLabelDark : null
 	                          ]}
 	                        >
                             <View style={styles.calendarLabelRow}>
-		                            {line.time ? (
-                                <Text numberOfLines={1} style={[styles.calendarLabelTime, isDark ? styles.calendarLabelTimeDark : null]}>
-                                  {line.time}
-                                </Text>
+		                            {timeLabel.start ? (
+                                hasRangeTime ? (
+                                  <View style={[styles.calendarLabelTimeCol, styles.calendarLabelTimeColRange]}>
+                                    <Text numberOfLines={1} style={[styles.calendarLabelTime, isDark ? styles.calendarLabelTimeDark : null]}>
+                                      {timeLabel.start}
+                                    </Text>
+                                    <Text numberOfLines={1} style={[styles.calendarLabelTime, isDark ? styles.calendarLabelTimeDark : null]}>
+                                      {timeLabel.end}
+                                    </Text>
+                                  </View>
+                                ) : (
+                                  <Text
+                                    numberOfLines={1}
+                                    style={[
+                                      styles.calendarLabelTime,
+                                      styles.calendarLabelTimeSingleSlot,
+                                      styles.calendarLabelTimeSingle,
+                                      isDark ? styles.calendarLabelTimeDark : null
+                                    ]}
+                                  >
+                                    {timeLabel.start}
+                                  </Text>
+                                )
                               ) : null}
-		                          <Text numberOfLines={1} style={[styles.calendarLabelText, isDark ? styles.calendarLabelTextDark : null]}>
+		                          <Text
+                                numberOfLines={1}
+                                ellipsizeMode="clip"
+                                style={[
+                                  styles.calendarLabelText,
+                                  !hasRangeTime ? styles.calendarLabelTextSingle : null,
+                                  hasRangeTime ? styles.calendarLabelTextRange : null,
+                                  isDark ? styles.calendarLabelTextDark : null
+                                ]}
+                              >
 		                            {line.text}
 		                          </Text>
                             </View>
@@ -4291,57 +4789,105 @@ function CalendarScreen({
         presentationStyle="overFullScreen"
         statusBarTranslucent
         animationType="fade"
-        onRequestClose={() => setSelectedDateKey(null)}
+        onRequestClose={closeDayModal}
       >
         <View style={styles.dayModalOverlay}>
-          <Pressable style={styles.dayModalBackdrop} onPress={() => setSelectedDateKey(null)} />
+          <Pressable style={styles.dayModalBackdrop} onPress={closeDayModal} />
           <View style={[styles.dayModalCard, isDark ? styles.dayModalCardDark : null]}>
             <View style={styles.dayModalHeader}>
               <View style={styles.dayModalHeaderLeft}>
                 <Text style={[styles.dayModalTitle, isDark ? styles.textDark : null]}>{selectedDateLabel || selectedDateKey}</Text>
                 <View style={[styles.dayModalCountPill, isDark ? styles.dayModalCountPillDark : null]}>
-                  <Text style={styles.dayModalCountText}>{dayItems.length}개</Text>
+                  <Text style={styles.dayModalCountText}>{dayModalCount}개</Text>
                 </View>
               </View>
               <View style={styles.dayModalHeaderRight}>
-                <Pressable
-                  onPress={() => {
-                    if (!selectedDateKey) return
-                    onAddPlan?.(selectedDateKey)
-                  }}
-                  style={[styles.dayModalAddBtn, isDark ? styles.dayModalAddBtnDark : null]}
-                >
-                  <Text style={styles.dayModalAddText}>+ 추가</Text>
-                </Pressable>
-                <Pressable onPress={() => setSelectedDateKey(null)} style={[styles.dayModalCloseBtn, isDark ? styles.dayModalCloseBtnDark : null]}>
-                  <Text style={[styles.dayModalCloseX, isDark ? styles.textDark : null]}>닫기</Text>
-                </Pressable>
+                {dayReorderMode ? (
+                  <Pressable
+                    onPress={closeDayReorderModeWithSave}
+                    style={[styles.dayModalAddBtn, isDark ? styles.dayModalAddBtnDark : null]}
+                    disabled={dayReorderSaving}
+                  >
+                    <Text style={styles.dayModalAddText}>{dayReorderSaving ? "저장중" : "완료"}</Text>
+                  </Pressable>
+                ) : (
+                  <>
+                    <Pressable
+                      onPress={() => {
+                        if (!selectedDateKey) return
+                        onAddPlan?.(selectedDateKey)
+                      }}
+                      style={[styles.dayModalAddBtn, isDark ? styles.dayModalAddBtnDark : null]}
+                    >
+                      <Text style={styles.dayModalAddText}>+ 추가</Text>
+                    </Pressable>
+                    <Pressable onPress={closeDayModal} style={[styles.dayModalCloseBtn, isDark ? styles.dayModalCloseBtnDark : null]}>
+                      <Text style={[styles.dayModalCloseX, isDark ? styles.textDark : null]}>닫기</Text>
+                    </Pressable>
+                  </>
+                )}
               </View>
             </View>
-            <ScrollView contentContainerStyle={styles.dayModalList}>
-              {dayItems.length === 0 ? (
+            <ScrollView contentContainerStyle={styles.dayModalList} scrollEnabled={!dayDraggingId}>
+              {dayReorderMode ? (
+                <View style={styles.reorderNoTimeList} {...dayPanResponder.panHandlers}>
+                  {dayReorderItems.length === 0 ? (
+                    <View style={styles.dayModalEmpty}>
+                      <Text style={[styles.dayModalEmptyTitle, isDark ? styles.textDark : null]}>할 일이 없어요</Text>
+                      <Text style={[styles.dayModalEmptySub, isDark ? styles.textMutedDark : null]}>이 날짜에 등록된 일정이 없습니다.</Text>
+                    </View>
+                  ) : (
+                    dayReorderItems.map((item) => {
+                      const rowId = String(item?.id ?? "").trim()
+                      const rowKey = rowId || `${item?.date}-${item?.content}`
+                      const isPlaceholder = rowId && rowId === dayDraggingId
+                      return renderDayModalRow(item, {
+                        rowKey,
+                        draggable: true,
+                        placeholder: isPlaceholder,
+                        onLayout: (event) => {
+                          if (!rowId) return
+                          const layout = event?.nativeEvent?.layout
+                          if (!layout) return
+                          dayLayoutsRef.current[rowId] = { y: layout.y, height: layout.height }
+                        },
+                        onLongPress: () => startDayDrag(item),
+                        onDelete: () => quickDeleteFromDayReorder(item)
+                      })
+                    })
+                  )}
+                  {dayDraggingItem ? (
+                    <Animated.View pointerEvents="none" style={[styles.reorderDragOverlay, { transform: [{ translateY: dayDragY }] }]}>
+                      {renderDayModalRow(dayDraggingItem, { ghost: true })}
+                    </Animated.View>
+                  ) : null}
+                </View>
+              ) : dayItems.length === 0 ? (
                 <View style={styles.dayModalEmpty}>
                   <Text style={[styles.dayModalEmptyTitle, isDark ? styles.textDark : null]}>할 일이 없어요</Text>
                   <Text style={[styles.dayModalEmptySub, isDark ? styles.textMutedDark : null]}>이 날짜에 등록된 일정이 없습니다.</Text>
                 </View>
               ) : (
                 dayItems.map((item) => {
-                  const line = formatLine(item)
-                  const time = buildPlanTimeTextFromRow(item)
-                  return (
-                    <Pressable
-                      key={item.id ?? `${item.date}-${item.content}`}
-                      style={[styles.dayModalItemRow, isDark ? styles.dayModalItemRowDark : null]}
-                      onPress={() => onEditPlan?.(item)}
-                    >
-                      {time ? (
-                        <Text style={[styles.dayModalItemTime, isDark ? styles.textMutedDark : null]}>{time}</Text>
-                      ) : (
-                        <Text style={styles.dayModalItemTimeEmpty}>{"\u00A0"}</Text>
-                      )}
-                      <Text style={[styles.dayModalItemText, isDark ? styles.textDark : null]}>{line.text}</Text>
-                    </Pressable>
-                  )
+                  const itemId = String(item?.id ?? "").trim()
+                  const canReorder = Boolean(onReorderNoTime && itemId)
+                  const handlePress = () => {
+                    if (daySuppressPressRef.current) {
+                      daySuppressPressRef.current = false
+                      return
+                    }
+                    onEditPlan?.(item)
+                  }
+                  const handleLongPress = () => {
+                    if (!canReorder) return
+                    daySuppressPressRef.current = true
+                    openDayReorder(dayItems, itemId)
+                  }
+                  return renderDayModalRow(item, {
+                    rowKey: item.id ?? `${item.date}-${item.content}`,
+                    onPress: handlePress,
+                    onLongPress: canReorder ? handleLongPress : undefined
+                  })
                 })
               )}
             </ScrollView>
@@ -4931,9 +5477,10 @@ function AppInner() {
     loadRightMemos(session.user.id, memoYear)
   }, [session?.user?.id])
 
-  async function loadPlans(userId) {
+  async function loadPlans(userId, options = {}) {
     if (!supabase || !userId) return
-    setLoading(true)
+    const silent = Boolean(options?.silent)
+    if (!silent) setLoading(true)
     let data = null
     let error = null
     if (sortOrderSupportedRef.current) {
@@ -4976,8 +5523,32 @@ function AppInner() {
       setPlans(data ?? [])
       await backfillSortOrderFromLegacy(userId, data ?? [])
     }
-    setLoading(false)
+    if (!silent) setLoading(false)
   }
+
+  useEffect(() => {
+    const now = new Date()
+    const todayKey = dateToKey(now.getFullYear(), now.getMonth() + 1, now.getDate())
+    if (!session?.user?.id) {
+      syncAndroidWidgetPayload({
+        list: {
+          rows: [],
+          emptyText: "로그인이 필요합니다."
+        },
+        calendar: {
+          title: `${now.getMonth() + 1}월`,
+          anchorDateKey: todayKey,
+          todayKey,
+          itemsByDate: {},
+          emptyText: "로그인이 필요합니다."
+        },
+        updatedAt: new Date().toISOString()
+      })
+      return
+    }
+    const payload = buildWidgetsPayload(plans, todayKey)
+    syncAndroidWidgetPayload(payload)
+  }, [plans, session?.user?.id])
 
   async function backfillSortOrderFromLegacy(userId, rows) {
     if (!sortOrderSupportedRef.current) return
@@ -5701,9 +6272,11 @@ function isEndTimeColumnError(error) {
         affectedPlanIds = await insertPlansInChunks(rows)
       }
 
-      await setAlarmEnabledForIds(userId, affectedPlanIds, nextAlarmEnabled)
-      await setAlarmLeadMinutesForIds(userId, affectedPlanIds, nextAlarmLeadMinutes)
-      await loadPlans(userId)
+      await Promise.all([
+        setAlarmEnabledForIds(userId, affectedPlanIds, nextAlarmEnabled),
+        setAlarmLeadMinutesForIds(userId, affectedPlanIds, nextAlarmLeadMinutes)
+      ])
+      loadPlans(userId, { silent: true }).catch(() => {})
       return true
     } catch (error) {
       const message = error?.message || "Save failed."
@@ -5803,7 +6376,7 @@ function isEndTimeColumnError(error) {
         throw error
       }
 
-      await loadPlans(userId)
+      loadPlans(userId, { silent: true }).catch(() => {})
       return true
     } catch (error) {
       setAuthMessage(error?.message || "Delete failed.")
@@ -6233,6 +6806,9 @@ function isEndTimeColumnError(error) {
               onAddPlan={openNewPlan}
               onEditPlan={openEditPlan}
               onReorderNoTime={reorderNoTimePlans}
+              onQuickDeletePlan={async (item) => {
+                await softDeletePlan(session?.user?.id, { ...(item ?? {}), delete_scope: "single" })
+              }}
               onRefresh={() => {
                 loadPlans(session?.user?.id)
                 loadWindows(session?.user?.id)
@@ -6288,6 +6864,10 @@ function isEndTimeColumnError(error) {
               ensureHolidayYear={ensureHolidayYear}
               onAddPlan={openNewPlan}
               onEditPlan={openEditPlan}
+              onReorderNoTime={reorderNoTimePlans}
+              onQuickDeletePlan={async (item) => {
+                await softDeletePlan(session?.user?.id, { ...(item ?? {}), delete_scope: "single" })
+              }}
               onSelectDateKey={(key) => {
                 lastCalendarDateKeyRef.current = key
               }}
@@ -7271,6 +7851,24 @@ const styles = StyleSheet.create({
     fontWeight: "900",
     color: ACCENT_RED
   },
+  sectionHeaderDoneBtn: {
+    height: 22,
+    minWidth: 46,
+    paddingHorizontal: 10,
+    borderRadius: 11,
+    backgroundColor: ACCENT_BLUE,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  sectionHeaderDoneBtnDark: {
+    backgroundColor: "#3b82f6"
+  },
+  sectionHeaderDoneBtnText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#ffffff",
+    includeFontPadding: false
+  },
   listContent: {
     flexGrow: 1,
     paddingBottom: 12,
@@ -7880,7 +8478,7 @@ const styles = StyleSheet.create({
   },
   calendarHolidayText: {
     width: "100%",
-    marginTop: 2,
+    marginTop: -1,
     paddingLeft: 4,
     fontSize: 8,
     fontWeight: "800",
@@ -7910,15 +8508,38 @@ const styles = StyleSheet.create({
   calendarLabel: {
     width: "100%",
     paddingHorizontal: 4,
-    height: 13,
+    minHeight: 13,
+    paddingVertical: 1,
     borderRadius: 4,
     alignItems: "flex-start",
     justifyContent: "center"
+  },
+  calendarLabelRange: {
+    minHeight: 17
   },
   calendarLabelRow: {
     width: "100%",
     flexDirection: "row",
     alignItems: "center"
+  },
+  calendarLabelTimeCol: {
+    minWidth: 18,
+    width: 18,
+    marginRight: 1,
+    alignItems: "flex-start",
+    justifyContent: "center",
+    alignSelf: "center",
+    flexShrink: 0
+  },
+  calendarLabelTimeColRange: {
+    justifyContent: "center"
+  },
+  calendarLabelTimeSingleSlot: {
+    minWidth: 18,
+    width: 18,
+    marginRight: 1,
+    alignSelf: "center",
+    textAlign: "left"
   },
   calendarLabelDark: {
     borderWidth: 0
@@ -7930,7 +8551,10 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     includeFontPadding: false,
     textAlignVertical: "center",
-    marginRight: 2
+    marginRight: 0
+  },
+  calendarLabelTimeSingle: {
+    lineHeight: 10
   },
   calendarLabelTimeDark: {
     color: "rgba(11, 18, 32, 0.82)"
@@ -7942,8 +8566,15 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     flex: 1,
     textAlign: "left",
+    alignSelf: "center",
     includeFontPadding: false,
     textAlignVertical: "center"
+  },
+  calendarLabelTextSingle: {
+    marginTop: -2
+  },
+  calendarLabelTextRange: {
+    alignSelf: "center"
   },
   calendarLabelTextDark: {
     color: "#0b1220"
@@ -8158,17 +8789,16 @@ const styles = StyleSheet.create({
     elevation: 0
   },
   reorderInlineCard: {
-    marginTop: 6,
-    marginBottom: 4,
-    borderRadius: 14,
-    backgroundColor: "#ffffff",
-    borderWidth: 1,
-    borderColor: "#e2e8f0",
-    padding: 12
+    marginTop: 0,
+    marginBottom: 0,
+    borderRadius: 0,
+    backgroundColor: "transparent",
+    borderWidth: 0,
+    padding: 0
   },
   reorderInlineCardDark: {
-    backgroundColor: DARK_SURFACE,
-    borderColor: DARK_BORDER
+    backgroundColor: "transparent",
+    borderWidth: 0
   },
   reorderInlineHeader: {
     flexDirection: "row",
@@ -8269,6 +8899,7 @@ const styles = StyleSheet.create({
   },
   reorderDragOverlay: {
     position: "absolute",
+    top: 0,
     left: 0,
     right: 0,
     zIndex: 20
@@ -8303,6 +8934,27 @@ const styles = StyleSheet.create({
   },
   reorderHandleTextDark: {
     color: DARK_MUTED
+  },
+  reorderDeleteBtn: {
+    width: 24,
+    height: 24,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    backgroundColor: "#f8fafc",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 2
+  },
+  reorderDeleteBtnDark: {
+    backgroundColor: "rgba(255, 255, 255, 0.06)",
+    borderColor: DARK_BORDER
+  },
+  reorderDeleteBtnText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#94a3b8",
+    includeFontPadding: false
   },
   reorderEmpty: {
     paddingVertical: 12,
