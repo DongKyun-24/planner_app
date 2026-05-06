@@ -5818,6 +5818,7 @@ function MemoScreen({
                         style={[
                           styles.memoAllCard,
                           isDark ? styles.cardDark : null,
+                          allMemoWindowMenuOpen ? styles.memoAllCardMenuOpen : null,
                           { borderLeftWidth: 4, borderLeftColor: w.color || "#94a3b8" }
                         ]}
                       >
@@ -5851,8 +5852,9 @@ function MemoScreen({
                           <View style={[styles.memoAllWindowMenu, isDark ? styles.memoAllWindowMenuDark : null]}>
                             <ScrollView
                               nestedScrollEnabled
-                              showsVerticalScrollIndicator
+                              showsVerticalScrollIndicator={false}
                               style={styles.memoAllWindowMenuScroll}
+                              contentContainerStyle={styles.memoAllWindowMenuList}
                             >
                               {filteredMemoWindows.map((windowItem, index) => {
                                 const active =
@@ -5878,8 +5880,8 @@ function MemoScreen({
                                         numberOfLines={1}
                                         style={[
                                           styles.memoAllWindowMenuItemText,
-                                          active ? styles.memoAllWindowMenuItemTextActive : null,
-                                          isDark ? styles.textDark : null
+                                          isDark ? styles.textDark : null,
+                                          active ? styles.memoAllWindowMenuItemTextActive : null
                                         ]}
                                       >
                                         {windowItem.title}
@@ -6369,6 +6371,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
   const isDark = tone === "dark"
   const insets = useSafeAreaInsets()
   const editorScrollRef = useRef(null)
+  const contentInputRef = useRef(null)
   const contentDraftRef = useRef("")
   const [initialSnapshot, setInitialSnapshot] = useState(null)
   const [date, setDate] = useState("")
@@ -6400,6 +6403,22 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
   const [iosTempRepeatUntil, setIosTempRepeatUntil] = useState(new Date())
   const [weekDaySheetVisible, setWeekDaySheetVisible] = useState(false)
   const [categorySheetVisible, setCategorySheetVisible] = useState(false)
+  const [repeatUntilActionSheetVisible, setRepeatUntilActionSheetVisible] = useState(false)
+
+  const blurContentInput = useCallback(() => {
+    contentInputRef.current?.blur?.()
+    Keyboard.dismiss()
+  }, [])
+
+  const blurContentInputWhenTouchingOutside = useCallback(
+    (event) => {
+      const contentNode = findNodeHandle(contentInputRef.current)
+      const targetNode = event?.nativeEvent?.target
+      if (contentNode && targetNode !== contentNode) blurContentInput()
+      return false
+    },
+    [blurContentInput]
+  )
 
   useEffect(() => {
     if (!visible) {
@@ -6452,6 +6471,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
     setIosRepeatUntilSheetVisible(false)
     setWeekDaySheetVisible(false)
     setCategorySheetVisible(false)
+    setRepeatUntilActionSheetVisible(false)
     setIosTempRepeatUntil(parseDateKey(String(repeatMeta.repeatUntil ?? "")) ?? parseDateKey(String(draft?.date ?? "")) ?? new Date())
     const pickerSeed = normalizeClockTime(initialState.endTime || initialState.time)
     if (pickerSeed) {
@@ -6562,6 +6582,15 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
   const repeatUntilValue = useMemo(() => parseDateKey(repeatUntil) ?? dateValue, [repeatUntil, dateValue])
   const isRecurring = repeatType !== "none"
   const isRepeatUntilActive = isRecurring || Boolean(repeatUntil)
+  const repeatUntilActionKey = isRecurring && !repeatUntil ? "continue" : repeatUntil ? "date" : "none"
+  const repeatUntilActionOptions = useMemo(
+    () => [
+      { key: "date", label: "날짜 선택" },
+      { key: "continue", label: "계속 반복" },
+      { key: "none", label: "종료일 없음" }
+    ],
+    []
+  )
   const shouldShowEditorMeta = !isKeyboardOpen
   const hasSavedDraft = draft?.id != null && String(draft.id).trim() !== ""
   const repeatWeekLabels = useMemo(() => ["일", "월", "화", "수", "목", "금", "토"], [])
@@ -6666,6 +6695,31 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
     setRepeatType("none")
     setRepeatInterval(1)
     setRepeatDays([])
+  }
+
+  function openRepeatUntilDatePicker() {
+    if (Platform.OS === "ios") {
+      setIosTempRepeatUntil(repeatUntilValue)
+      setIosRepeatUntilSheetVisible(true)
+      return
+    }
+    setShowRepeatUntilPicker(true)
+  }
+
+  function handleRepeatUntilAction(actionKey) {
+    const action = String(actionKey ?? "")
+    setRepeatUntilActionSheetVisible(false)
+    if (action === "date") {
+      openRepeatUntilDatePicker()
+      return
+    }
+    if (action === "continue") {
+      applyOpenEndedRepeat()
+      return
+    }
+    if (action === "none") {
+      clearRepeatUntilDate()
+    }
   }
 
   function handleSave() {
@@ -6779,23 +6833,40 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
               marginBottom: safeBottomInset
             }
           ]}
+          onTouchStart={blurContentInputWhenTouchingOutside}
         >
           <View style={styles.editorHeader}>
             <View style={styles.editorHeaderMain}>
               <Pressable
-                onPress={() => setCategorySheetVisible(true)}
-                style={[styles.editorHeaderCategoryBtn, isDark ? styles.editorHeaderCategoryBtnDark : null]}
+                onPress={() => setCategorySheetVisible((prev) => !prev)}
+                style={[
+                  styles.editorHeaderCategoryBtn,
+                  isDark ? styles.editorHeaderCategoryBtnDark : null,
+                  selectedCategoryOption?.key === "__general__"
+                    ? (isDark ? styles.editorHeaderCategoryBtnGeneralDark : styles.editorHeaderCategoryBtnGeneral)
+                    : null
+                ]}
               >
-                {selectedCategoryOption?.key !== "__general__" ? (
-                  <View style={[styles.tabDot, { backgroundColor: selectedCategoryOption?.color || "#94a3b8" }]} />
-                ) : null}
+                <View
+                  style={[
+                    styles.tabDot,
+                    {
+                      backgroundColor:
+                        selectedCategoryOption?.key === "__general__"
+                          ? (isDark ? "rgba(148, 163, 184, 0.78)" : "#94a3b8")
+                          : selectedCategoryOption?.color || "#94a3b8"
+                    }
+                  ]}
+                />
                 <Text
                   numberOfLines={1}
                   style={[styles.editorHeaderCategoryText, isDark ? styles.textDark : null]}
                 >
                   {selectedCategoryOption?.label || "없음"}
                 </Text>
-                <Text style={[styles.editorHeaderCategoryChevron, isDark ? styles.textMutedDark : null]}>⌄</Text>
+                <Text style={[styles.editorHeaderCategoryChevron, isDark ? styles.textMutedDark : null]}>
+                  {categorySheetVisible ? "▴" : "▾"}
+                </Text>
               </Pressable>
             </View>
             <View style={styles.editorHeaderActions}>
@@ -6804,18 +6875,75 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
               </Pressable>
             </View>
           </View>
+          {categorySheetVisible ? (
+            <View style={styles.editorCategoryDropdownLayer} pointerEvents="box-none">
+              <Pressable style={styles.editorCategoryDropdownBackdrop} onPress={() => setCategorySheetVisible(false)} />
+              <View style={[styles.editorCategoryDropdownCard, isDark ? styles.editorCategoryDropdownCardDark : null]}>
+                <ScrollView
+                  style={styles.editorCategoryDropdownScroll}
+                  contentContainerStyle={styles.editorCategoryDropdownList}
+                  showsVerticalScrollIndicator={false}
+                  nestedScrollEnabled
+                >
+                  {options.map((opt) => {
+                    const active = String(opt?.key) === String(category)
+                    return (
+                      <Pressable
+                        key={`editor-category-dropdown-${opt?.key}`}
+                        onPress={() => {
+                          setCategory(String(opt?.key ?? "__general__") || "__general__")
+                          setCategorySheetVisible(false)
+                        }}
+                        style={[
+                          styles.editorCategoryDropdownItem,
+                          isDark ? styles.editorCategoryDropdownItemDark : null,
+                          active ? styles.editorCategoryDropdownItemActive : null,
+                          active && isDark ? styles.editorCategoryDropdownItemActiveDark : null
+                        ]}
+                      >
+                        <View
+                          style={[
+                            styles.tabDot,
+                            {
+                              backgroundColor:
+                                opt?.key === "__general__"
+                                  ? (isDark ? "rgba(148, 163, 184, 0.78)" : "#94a3b8")
+                                  : opt?.color || "#94a3b8"
+                            }
+                          ]}
+                        />
+                        <Text
+                          numberOfLines={1}
+                          style={[
+                            styles.editorCategoryDropdownText,
+                            isDark ? styles.textDark : null,
+                            active ? styles.editorCategoryDropdownTextActive : null
+                          ]}
+                        >
+                          {opt?.label}
+                        </Text>
+                        {active ? <Text style={styles.editorCategoryDropdownCheck}>✓</Text> : null}
+                      </Pressable>
+                    )
+                  })}
+                </ScrollView>
+              </View>
+            </View>
+          ) : null}
 
           <ScrollView
             ref={editorScrollRef}
             style={styles.editorBody}
             contentContainerStyle={[styles.editorBodyContent, { paddingBottom: editorBodyBottomPadding }]}
+            onStartShouldSetResponderCapture={blurContentInputWhenTouchingOutside}
+            onTouchStart={blurContentInputWhenTouchingOutside}
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
           >
-            <View style={[styles.editorMetaRow, styles.editorSectionGapLarge]}>
-              <Text style={[styles.editorMetaLabel, isDark ? styles.textMutedDark : null]}>내용</Text>
+            <View style={[styles.editorMetaRow, styles.editorContentMetaRow]}>
               <View style={[styles.editorTextareaWrap, isDark ? styles.editorTextareaWrapDark : null]}>
                 <TextInput
+                  ref={contentInputRef}
                   value={content}
                   onChangeText={(nextText) => {
                     contentDraftRef.current = nextText
@@ -6835,11 +6963,6 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
 
             {shouldShowEditorMeta ? (
               <View style={styles.editorMetaRow}>
-                <View style={[styles.editorMetaLabelRow, styles.editorMetaLabelRowTight]}>
-                  <Text style={[styles.editorMetaLabel, styles.editorMetaLabelInline, isDark ? styles.textMutedDark : null]}>
-                    일정
-                  </Text>
-                </View>
                 <View style={styles.editorInlinePair}>
                   <Pressable
                     style={[styles.editorPickerRow, styles.editorInlineHalf, isDark ? styles.editorPickerRowDark : null]}
@@ -6862,14 +6985,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
                   <Pressable
                     style={[styles.editorPickerRow, styles.editorInlineHalf, isDark ? styles.editorPickerRowDark : null]}
                     accessibilityRole="button"
-                    onPress={() => {
-                      if (Platform.OS === "ios") {
-                        setIosTempRepeatUntil(repeatUntilValue)
-                        setIosRepeatUntilSheetVisible(true)
-                        return
-                      }
-                      setShowRepeatUntilPicker(true)
-                    }}
+                    onPress={() => setRepeatUntilActionSheetVisible(true)}
                   >
                     <View style={styles.editorPickerLeft}>
                       <Text
@@ -6887,40 +7003,6 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
                             ? formatDateWithWeekday(repeatUntil)
                             : "종료일 없음"}
                       </Text>
-                      <Pressable
-                        onPress={(event) => {
-                          event?.stopPropagation?.()
-                          applyOpenEndedRepeat()
-                        }}
-                        style={[
-                          styles.editorPickerClearPill,
-                          isDark ? styles.editorPickerClearPillDark : null,
-                          isRecurring && !repeatUntil ? styles.editorPickerContinuePillActive : null
-                        ]}
-                        hitSlop={8}
-                      >
-                        <Text
-                          style={[
-                            styles.editorPickerClearText,
-                            isDark ? styles.textDark : null,
-                            isRecurring && !repeatUntil ? styles.editorPickerContinueTextActive : null
-                          ]}
-                        >
-                          계속
-                        </Text>
-                      </Pressable>
-                      {isRepeatUntilActive ? (
-                        <Pressable
-                          onPress={(event) => {
-                            event?.stopPropagation?.()
-                            clearRepeatUntilDate()
-                          }}
-                          style={[styles.editorPickerClearPill, isDark ? styles.editorPickerClearPillDark : null]}
-                          hitSlop={8}
-                        >
-                          <Text style={[styles.editorPickerClearText, isDark ? styles.textDark : null]}>없음</Text>
-                        </Pressable>
-                      ) : null}
                     </View>
                   </Pressable>
                 </View>
@@ -7030,9 +7112,6 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
             ) : null}
 
             <View style={[styles.editorMetaRow, styles.editorSectionGapLarge]}>
-              <View style={[styles.editorMetaLabelRow, styles.editorMetaLabelRowTight]}>
-                <Text style={[styles.editorMetaLabel, styles.editorMetaLabelInline, isDark ? styles.textMutedDark : null]}>시간</Text>
-              </View>
               <Pressable
                 onPress={() => {
                   if (time) {
@@ -7083,6 +7162,8 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
                     >
                       {time ? timeDisplay : "시간 선택 안함"}
                     </Text>
+                  </View>
+                  <View style={styles.editorPickerRight}>
                     {time ? (
                       <Pressable
                         onPress={(event) => {
@@ -7131,6 +7212,8 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
                     >
                       {endTime ? endTimeDisplay : "종료시간 없음"}
                     </Text>
+                  </View>
+                  <View style={styles.editorPickerRight}>
                     {endTime ? (
                       <Pressable
                         onPress={(event) => {
@@ -7211,8 +7294,8 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
             ) : null}
 
             <View style={[styles.editorActions, isKeyboardOpen ? styles.editorActionsCompact : null]}>
-              <Pressable onPress={confirmDelete} style={styles.editorDangerBtn}>
-                <Text style={styles.editorDangerText}>삭제</Text>
+              <Pressable onPress={confirmDelete} style={[styles.editorDangerBtn, isDark ? styles.editorDangerBtnDark : null]}>
+                <Text style={[styles.editorDangerText, isDark ? styles.editorDangerTextDark : null]}>삭제</Text>
               </Pressable>
               <Pressable onPress={handleSave} style={styles.editorSaveBtn}>
                 <Text style={styles.editorSaveText}>저장</Text>
@@ -7285,16 +7368,13 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
         }}
       />
       <OptionSelectSheet
-        visible={categorySheetVisible}
-        title="탭 선택"
-        options={options}
-        selectedKey={category}
+        visible={repeatUntilActionSheetVisible}
+        title="반복 종료일"
+        options={repeatUntilActionOptions}
+        selectedKey={repeatUntilActionKey}
         tone={tone}
-        onSelect={(key) => {
-          setCategory(String(key ?? "__general__") || "__general__")
-          setCategorySheetVisible(false)
-        }}
-        onClose={() => setCategorySheetVisible(false)}
+        onSelect={handleRepeatUntilAction}
+        onClose={() => setRepeatUntilActionSheetVisible(false)}
       />
       <WeekdaySelectSheet
         visible={weekDaySheetVisible}
@@ -12530,7 +12610,7 @@ const styles = StyleSheet.create({
   headerLogoText: {
     color: "#ffffff",
     fontWeight: "900",
-    fontSize: 16,
+    fontSize: 18,
     includeFontPadding: false,
     textAlign: "center"
   },
@@ -13783,6 +13863,10 @@ const styles = StyleSheet.create({
     borderColor: "#e2e8f0",
     padding: 14
   },
+  memoAllCardMenuOpen: {
+    zIndex: 20,
+    elevation: 20
+  },
   memoAllHeader: {
     flexDirection: "row",
     alignItems: "flex-start",
@@ -13821,7 +13905,7 @@ const styles = StyleSheet.create({
     color: "#0f172a"
   },
   memoAllHeaderDropdownChevron: {
-    fontSize: 14,
+    fontSize: 16,
     fontWeight: "900",
     color: "#64748b"
   },
@@ -13831,65 +13915,78 @@ const styles = StyleSheet.create({
     color: "#64748b"
   },
   memoAllWindowMenu: {
-    marginTop: 10,
-    marginBottom: 10,
+    position: "absolute",
+    top: 44,
+    left: 14,
+    width: 168,
+    zIndex: 30,
+    elevation: 24,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#d7e3f4",
+    borderColor: "#d6dbe6",
     backgroundColor: "#ffffff",
-    overflow: "hidden",
-    maxHeight: 220
+    padding: 6,
+    maxHeight: 220,
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.14,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 }
   },
   memoAllWindowMenuDark: {
-    backgroundColor: DARK_SURFACE,
-    borderColor: DARK_BORDER
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: DARK_BORDER,
+    shadowOpacity: 0
   },
   memoAllWindowMenuScroll: {
-    maxHeight: 220
+    maxHeight: 208
+  },
+  memoAllWindowMenuList: {
+    gap: 5
   },
   memoAllWindowMenuItem: {
-    minHeight: 42,
-    paddingHorizontal: 14,
+    minHeight: 40,
+    borderRadius: 10,
+    paddingHorizontal: 10,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    gap: 10,
-    borderTopWidth: 1,
-    borderTopColor: "#eef3f8"
+    gap: 9,
+    borderTopWidth: 0,
+    backgroundColor: "transparent"
   },
   memoAllWindowMenuItemFirst: {
     borderTopWidth: 0
   },
   memoAllWindowMenuItemDark: {
-    borderTopColor: "rgba(255, 255, 255, 0.06)"
+    backgroundColor: "transparent"
   },
   memoAllWindowMenuItemActive: {
-    backgroundColor: "#f8fbff"
+    backgroundColor: "#eef2ff"
   },
   memoAllWindowMenuItemActiveDark: {
-    backgroundColor: "rgba(59, 130, 246, 0.12)"
+    backgroundColor: "rgba(43, 103, 199, 0.24)"
   },
   memoAllWindowMenuItemLeft: {
     flex: 1,
     minWidth: 0,
     flexDirection: "row",
     alignItems: "center",
-    gap: 10
+    gap: 9
   },
   memoAllWindowMenuItemText: {
     flex: 1,
     minWidth: 0,
     fontSize: 14,
-    fontWeight: "800",
+    fontWeight: "900",
     color: "#334155"
   },
   memoAllWindowMenuItemTextActive: {
-    color: "#1d4ed8"
+    color: ACCENT_BLUE
   },
   memoAllWindowMenuCheck: {
-    fontSize: 13,
+    fontSize: 14,
     fontWeight: "900",
-    color: "#2563eb"
+    color: ACCENT_BLUE
   },
   memoAllMetaRow: {
     marginTop: 2,
@@ -13938,7 +14035,7 @@ const styles = StyleSheet.create({
     color: "#0f172a"
   },
   memoAllInput: {
-    backgroundColor: "#f8fafc",
+    backgroundColor: "transparent",
     borderWidth: 1,
     borderColor: "#e2e8f0",
     borderRadius: 14,
@@ -15950,34 +16047,122 @@ const styles = StyleSheet.create({
     minWidth: 0
   },
   editorHeaderCategoryBtn: {
-    height: 40,
-    maxWidth: 210,
+    height: 34,
+    maxWidth: 178,
     alignSelf: "flex-start",
     flexDirection: "row",
     alignItems: "center",
-    gap: 7,
-    paddingHorizontal: 12,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#d6dbe6",
-    backgroundColor: "#f8fafc"
+    gap: 8,
+    paddingHorizontal: 6,
+    borderRadius: 8,
+    borderWidth: 0,
+    borderColor: "transparent",
+    backgroundColor: "#f8fafc",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0,
+    shadowRadius: 0,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 0
   },
   editorHeaderCategoryBtnDark: {
-    backgroundColor: "rgba(255, 255, 255, 0.06)",
-    borderColor: DARK_BORDER
+    backgroundColor: "transparent",
+    borderColor: "transparent",
+    shadowOpacity: 0,
+    elevation: 0
+  },
+  editorHeaderCategoryBtnGeneral: {
+    borderColor: "transparent",
+    backgroundColor: "transparent"
+  },
+  editorHeaderCategoryBtnGeneralDark: {
+    borderColor: "transparent",
+    backgroundColor: "transparent"
   },
   editorHeaderCategoryText: {
     flexShrink: 1,
     minWidth: 0,
+    maxWidth: 116,
     fontSize: 15,
     fontWeight: "900",
     color: "#0f172a"
   },
   editorHeaderCategoryChevron: {
+    marginLeft: 0,
     marginTop: -2,
-    fontSize: 15,
+    fontSize: 16,
     fontWeight: "900",
     color: "#64748b"
+  },
+  editorCategoryDropdownLayer: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 40
+  },
+  editorCategoryDropdownBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "transparent"
+  },
+  editorCategoryDropdownCard: {
+    position: "absolute",
+    left: 16,
+    top: 52,
+    width: 168,
+    maxWidth: "92%",
+    maxHeight: 286,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#d6dbe6",
+    backgroundColor: "#ffffff",
+    padding: 6,
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.14,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 12
+  },
+  editorCategoryDropdownCardDark: {
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: DARK_BORDER,
+    shadowOpacity: 0,
+    elevation: 0
+  },
+  editorCategoryDropdownScroll: {
+    maxHeight: 272
+  },
+  editorCategoryDropdownList: {
+    gap: 5
+  },
+  editorCategoryDropdownItem: {
+    minHeight: 40,
+    borderRadius: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+    paddingHorizontal: 10,
+    backgroundColor: "transparent"
+  },
+  editorCategoryDropdownItemDark: {
+    backgroundColor: "transparent"
+  },
+  editorCategoryDropdownItemActive: {
+    backgroundColor: "#eef2ff"
+  },
+  editorCategoryDropdownItemActiveDark: {
+    backgroundColor: "rgba(43, 103, 199, 0.24)"
+  },
+  editorCategoryDropdownText: {
+    flex: 1,
+    minWidth: 0,
+    fontSize: 14,
+    fontWeight: "900",
+    color: "#334155"
+  },
+  editorCategoryDropdownTextActive: {
+    color: ACCENT_BLUE
+  },
+  editorCategoryDropdownCheck: {
+    fontSize: 14,
+    fontWeight: "900",
+    color: ACCENT_BLUE
   },
   editorHeaderActions: {
     flexDirection: "row",
@@ -15985,16 +16170,16 @@ const styles = StyleSheet.create({
     gap: 8
   },
   editorCloseIconBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 12,
+    width: 34,
+    height: 34,
+    borderRadius: 10,
     backgroundColor: "#f1f5f9",
     alignItems: "center",
     justifyContent: "center"
   },
   editorCloseIconText: {
-    fontSize: 25,
-    lineHeight: 27,
+    fontSize: 22,
+    lineHeight: 24,
     fontWeight: "500",
     color: "#334155"
   },
@@ -16058,6 +16243,10 @@ const styles = StyleSheet.create({
   },
   editorSectionGapLarge: {
     marginTop: 14
+  },
+  editorContentMetaRow: {
+    marginTop: 6,
+    marginBottom: 8
   },
   editorBody: {
     flexGrow: 0
@@ -16403,15 +16592,16 @@ const styles = StyleSheet.create({
     marginBottom: 0
   },
   editorTextareaWrap: {
-    height: 110,
-    minHeight: 110,
-    maxHeight: 110,
+    height: 136,
+    minHeight: 136,
+    maxHeight: 136,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: "#d6dbe6",
     backgroundColor: "#ffffff",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingHorizontal: 16,
+    paddingTop: 14,
+    paddingBottom: 10,
     overflow: "hidden"
   },
   editorTextareaWrapDark: {
@@ -16423,14 +16613,14 @@ const styles = StyleSheet.create({
     minHeight: 0,
     margin: 0,
     padding: 0,
-    fontSize: 14,
-    lineHeight: 20,
+    fontSize: 17,
+    lineHeight: 24,
     fontWeight: "600",
     color: "#0f172a"
   },
   editorTextarea: {
     marginBottom: 0,
-    height: 110,
+    height: 136,
     textAlignVertical: "top"
   },
   editorActions: {
@@ -16540,17 +16730,10 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(255, 255, 255, 0.06)",
     borderColor: DARK_BORDER
   },
-  editorPickerContinuePillActive: {
-    backgroundColor: "rgba(43, 103, 199, 0.14)",
-    borderColor: ACCENT_BLUE
-  },
   editorPickerClearText: {
     fontSize: 11,
     fontWeight: "900",
     color: "#475569"
-  },
-  editorPickerContinueTextActive: {
-    color: ACCENT_BLUE
   },
   editorAlarmRow: {
     marginTop: 8,
@@ -17260,17 +17443,26 @@ const styles = StyleSheet.create({
     color: "#ffffff"
   },
   editorDangerBtn: {
-    height: 40,
-    paddingHorizontal: 16,
-    borderRadius: 12,
-    backgroundColor: "#fee2e2",
+    height: 42,
+    paddingHorizontal: 18,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "rgba(208, 75, 75, 0.28)",
+    backgroundColor: "rgba(208, 75, 75, 0.10)",
     alignItems: "center",
     justifyContent: "center"
+  },
+  editorDangerBtnDark: {
+    borderColor: "rgba(248, 113, 113, 0.30)",
+    backgroundColor: "rgba(248, 113, 113, 0.10)"
   },
   editorDangerText: {
     fontSize: 13,
     fontWeight: "900",
     color: ACCENT_RED
+  },
+  editorDangerTextDark: {
+    color: "#fecaca"
   },
   detailCard: {
     flex: 1
