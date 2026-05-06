@@ -20,11 +20,14 @@ expo-env.d.ts
 
 # Metro
 .metro-health-check*
+metro.log
+metro.err
 
 # debug
 npm-debug.*
 yarn-debug.*
 yarn-error.*
+widget_*.png
 
 # macOS
 .DS_Store
