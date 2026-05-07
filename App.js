@@ -146,6 +146,9 @@ const UI_FONT_SCALE_PRESETS = [
 const PLAN_ALARM_PREFS_KEY = "plannerMobile.planAlarmPrefs.v1"
 const PLAN_ALARM_LEAD_PREFS_KEY = "plannerMobile.planAlarmLeadPrefs.v1"
 const PLAN_NOTIFICATION_SCHEDULE_IDS_KEY = "plannerMobile.planNotificationScheduleIds.v1"
+const PLAN_CACHE_KEY_PREFIX = "plannerMobile.planCache.v1"
+const RIGHT_MEMO_CACHE_KEY_PREFIX = "plannerMobile.rightMemoCache.v1"
+const PENDING_REMOTE_WRITE_TTL_MS = 10 * 60 * 1000
 const PLAN_NOTIFICATION_CHANNEL_ID = "planner-reminders"
 const PLAN_NOTIFICATION_MAX_COUNT = Platform.OS === "android" ? 240 : 60
 const PLAN_NOTIFICATION_LOOKAHEAD_DAYS = Platform.OS === "android" ? 365 : 180
@@ -1579,6 +1582,29 @@ function dedupeRowsById(rows) {
     next.push(row)
   }
   return next.reverse()
+}
+
+function mergeRowsById(baseRows, overlayRows) {
+  const merged = []
+  const indexById = new Map()
+  const pushOrMerge = (row) => {
+    if (!row) return
+    const id = String(row?.id ?? "").trim()
+    if (!id) {
+      merged.push(row)
+      return
+    }
+    const existingIndex = indexById.get(id)
+    if (existingIndex == null) {
+      indexById.set(id, merged.length)
+      merged.push(row)
+      return
+    }
+    merged[existingIndex] = { ...(merged[existingIndex] ?? {}), ...(row ?? {}) }
+  }
+  for (const row of Array.isArray(baseRows) ? baseRows : []) pushOrMerge(row)
+  for (const row of Array.isArray(overlayRows) ? overlayRows : []) pushOrMerge(row)
+  return merged
 }
 
 function getPlanBucketKey(row) {
@@ -9228,6 +9254,7 @@ function AppInner() {
   const windowsLoadSeqRef = useRef(0)
   const rightMemosLoadSeqRef = useRef(0)
   const rightMemoMetaColumnsSupportedRef = useRef(true)
+  const pendingPlanWritesRef = useRef({})
   const pendingRightMemoWritesRef = useRef({})
   const appStateRef = useRef(AppState.currentState)
   const plansRef = useRef([])
@@ -9291,6 +9318,125 @@ function AppInner() {
 
   function notificationScheduleIdsStorageKey(userId) {
     return `${PLAN_NOTIFICATION_SCHEDULE_IDS_KEY}.${userId}`
+  }
+
+  function planCacheStorageKey(userId) {
+    return `${PLAN_CACHE_KEY_PREFIX}.${userId}`
+  }
+
+  function rightMemoCacheStorageKey(userId, year) {
+    return `${RIGHT_MEMO_CACHE_KEY_PREFIX}.${userId}.${year}`
+  }
+
+  function isFreshLocalWrite(savedAt) {
+    const at = Number(savedAt ?? 0)
+    return Number.isFinite(at) && at > 0 && Date.now() - at <= PENDING_REMOTE_WRITE_TTL_MS
+  }
+
+  async function readPlansCacheEntry(userId) {
+    if (!userId) return { rows: [], savedAt: 0 }
+    try {
+      const raw = await AsyncStorage.getItem(planCacheStorageKey(userId))
+      if (!raw) return { rows: [], savedAt: 0 }
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) return { rows: parsed, savedAt: 0 }
+      return {
+        rows: Array.isArray(parsed?.rows) ? parsed.rows : [],
+        savedAt: Number(parsed?.savedAt ?? 0) || 0
+      }
+    } catch (_e) {
+      return { rows: [], savedAt: 0 }
+    }
+  }
+
+  async function persistPlansCache(userId, rows) {
+    if (!userId) return
+    try {
+      await AsyncStorage.setItem(
+        planCacheStorageKey(userId),
+        JSON.stringify({ savedAt: Date.now(), rows: dedupeRowsById(rows ?? []) })
+      )
+    } catch (_e) {
+      // ignore cache errors
+    }
+  }
+
+  async function readRightMemosCacheEntry(userId, year) {
+    if (!userId) return { items: {}, savedAt: 0 }
+    try {
+      const raw = await AsyncStorage.getItem(rightMemoCacheStorageKey(userId, year))
+      if (!raw) return { items: {}, savedAt: 0 }
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        if (parsed.items && typeof parsed.items === "object") {
+          return { items: parsed.items, savedAt: Number(parsed.savedAt ?? 0) || 0 }
+        }
+        return { items: parsed, savedAt: 0 }
+      }
+      return { items: {}, savedAt: 0 }
+    } catch (_e) {
+      return { items: {}, savedAt: 0 }
+    }
+  }
+
+  async function persistRightMemosCache(userId, year, items) {
+    if (!userId) return
+    try {
+      await AsyncStorage.setItem(
+        rightMemoCacheStorageKey(userId, year),
+        JSON.stringify({ savedAt: Date.now(), items: items && typeof items === "object" ? items : {} })
+      )
+    } catch (_e) {
+      // ignore cache errors
+    }
+  }
+
+  function mergePendingPlanWrites(rows) {
+    const pending = { ...(pendingPlanWritesRef.current ?? {}) }
+    const overlay = []
+    let changed = false
+    const now = Date.now()
+    for (const [id, entry] of Object.entries(pending)) {
+      if (!entry || Number(entry.expiresAt ?? 0) <= now) {
+        delete pending[id]
+        changed = true
+        continue
+      }
+      if (entry.row) overlay.push(entry.row)
+    }
+    if (changed) pendingPlanWritesRef.current = pending
+    return mergeRowsById(rows, overlay)
+  }
+
+  function stagePlanRows(userId, rows) {
+    const list = Array.isArray(rows) ? rows.filter((row) => row && String(row?.id ?? "").trim()) : []
+    if (list.length === 0) return
+    const now = Date.now()
+    const pending = { ...(pendingPlanWritesRef.current ?? {}) }
+    for (const row of list) {
+      const id = String(row?.id ?? "").trim()
+      pending[id] = { row, expiresAt: now + PENDING_REMOTE_WRITE_TTL_MS }
+    }
+    pendingPlanWritesRef.current = pending
+    setPlans((prev) => {
+      const next = mergeRowsById(prev, list)
+      persistPlansCache(userId, next).catch(() => {})
+      return next
+    })
+  }
+
+  async function hydrateCachedPlannerState(userId) {
+    if (!userId) return
+    const [plansCache, rightMemoCache] = await Promise.all([
+      readPlansCacheEntry(userId),
+      readRightMemosCacheEntry(userId, memoYear)
+    ])
+    if (plansCache.rows.length > 0) {
+      setPlans((prev) => mergePendingPlanWrites(prev?.length ? prev : plansCache.rows))
+    }
+    if (rightMemoCache.items && Object.keys(rightMemoCache.items).length > 0) {
+      setRightMemos((prev) => ({ ...(rightMemoCache.items ?? {}), ...(prev ?? {}) }))
+    }
   }
 
   async function persistAlarmPrefs(userId, map) {
@@ -10001,6 +10147,7 @@ function AppInner() {
 
   useEffect(() => {
     if (!supabase || !session?.user?.id) return
+    hydrateCachedPlannerState(session.user.id).catch(() => {})
     loadPlans(session.user.id)
     loadWindows(session.user.id)
     loadRightMemos(session.user.id, memoYear)
@@ -10076,12 +10223,21 @@ function AppInner() {
       if (requestSeq !== plansLoadSeqRef.current) return
       if (error) {
         setAuthMessage(error.message || "Load failed.")
-        setPlans([])
+        const cached = await readPlansCacheEntry(userId)
+        if (cached.rows.length > 0) {
+          setPlans(mergePendingPlanWrites(cached.rows))
+        }
       } else {
-        const normalizedRows = dedupeRowsById(data ?? [])
-        setPlans(normalizedRows)
-        await backfillSortOrderFromLegacy(userId, normalizedRows)
-        ensureOpenEndedRecurringCoverage(userId, normalizedRows)
+        let normalizedRows = dedupeRowsById(data ?? [])
+        const cached = await readPlansCacheEntry(userId)
+        if (isFreshLocalWrite(cached.savedAt) && cached.rows.length > 0) {
+          normalizedRows = mergeRowsById(normalizedRows, cached.rows)
+        }
+        const protectedRows = mergePendingPlanWrites(normalizedRows)
+        setPlans(protectedRows)
+        await persistPlansCache(userId, protectedRows)
+        await backfillSortOrderFromLegacy(userId, protectedRows)
+        ensureOpenEndedRecurringCoverage(userId, protectedRows)
           .then((changed) => {
             if (!changed) return
             loadPlans(userId, { silent: true }).catch(() => {})
@@ -10362,6 +10518,14 @@ function AppInner() {
       if (!row?.window_id) continue
       map[row.window_id] = String(row?.content ?? "")
     }
+    const cached = await readRightMemosCacheEntry(userId, year)
+    if (isFreshLocalWrite(cached.savedAt)) {
+      for (const [id, value] of Object.entries(cached.items ?? {})) {
+        const key = String(id ?? "").trim()
+        if (!key) continue
+        map[key] = String(value ?? "")
+      }
+    }
     const now = Date.now()
     const pending = { ...(pendingRightMemoWritesRef.current ?? {}) }
     let pendingChanged = false
@@ -10384,6 +10548,7 @@ function AppInner() {
     }
     if (pendingChanged) pendingRightMemoWritesRef.current = pending
     setRightMemos(map)
+    await persistRightMemosCache(userId, year, map)
   }
 
   function stageRightMemoWrite(windowId, content) {
@@ -10392,9 +10557,13 @@ function AppInner() {
     const text = String(content ?? "")
     pendingRightMemoWritesRef.current = {
       ...(pendingRightMemoWritesRef.current ?? {}),
-      [id]: { value: text, expiresAt: Date.now() + 5000 }
+      [id]: { value: text, expiresAt: Date.now() + PENDING_REMOTE_WRITE_TTL_MS }
     }
-    setRightMemos((prev) => ({ ...(prev ?? {}), [id]: text }))
+    setRightMemos((prev) => {
+      const next = { ...(prev ?? {}), [id]: text }
+      persistRightMemosCache(session?.user?.id, memoYear, next).catch(() => {})
+      return next
+    })
   }
 
   async function saveRightMemo(windowId, content) {
@@ -10435,13 +10604,10 @@ function AppInner() {
       error = result?.error ?? null
     }
     if (error) {
-      const nextPending = { ...(pendingRightMemoWritesRef.current ?? {}) }
-      delete nextPending[id]
-      pendingRightMemoWritesRef.current = nextPending
       Alert.alert("오류", error.message || "메모 저장 실패")
-      await loadRightMemos(userId, memoYear)
       return
     }
+    await persistRightMemosCache(userId, memoYear, { ...(rightMemos ?? {}), [id]: text })
   }
 
   function getNextSortOrderForDate(dateKey, planRows) {
@@ -10786,31 +10952,33 @@ function isRightMemoMetaColumnError(error) {
     if (!Array.isArray(rows) || rows.length === 0) return []
     const chunkSize = 200
     const insertedIds = []
+    const userId = String(rows?.[0]?.user_id ?? session?.user?.id ?? "").trim()
     for (let i = 0; i < rows.length; i += chunkSize) {
       let insertChunk = rows.slice(i, i + chunkSize)
-      let { data, error } = await supabase.from("plans").insert(insertChunk).select("id")
+      let { data, error } = await supabase.from("plans").insert(insertChunk).select("*")
       if (error && isRepeatColumnError(error)) {
         markRepeatFallbackNotice()
         insertChunk = insertChunk.map((row) => stripRepeatColumns(row))
-        const retry = await supabase.from("plans").insert(insertChunk).select("id")
+        const retry = await supabase.from("plans").insert(insertChunk).select("*")
         data = retry.data
         error = retry.error
       }
       if (error && isEndTimeColumnError(error)) {
         markEndTimeFallbackNotice()
         insertChunk = stripEndTimeFromRows(insertChunk)
-        const retry = await supabase.from("plans").insert(insertChunk).select("id")
+        const retry = await supabase.from("plans").insert(insertChunk).select("*")
         data = retry.data
         error = retry.error
       }
       if (error && isSortOrderColumnError(error)) {
         markSortOrderFallbackNotice()
         insertChunk = stripSortOrderFromRows(insertChunk)
-        const retry = await supabase.from("plans").insert(insertChunk).select("id")
+        const retry = await supabase.from("plans").insert(insertChunk).select("*")
         data = retry.data
         error = retry.error
       }
       if (error) throw error
+      if ((data ?? []).length > 0) stagePlanRows(userId, data)
       for (const row of data ?? []) {
         const id = String(row?.id ?? "").trim()
         if (id) insertedIds.push(id)
@@ -10837,6 +11005,7 @@ function isRightMemoMetaColumnError(error) {
       error = retry.error
     }
     if (error) throw error
+    stagePlanRows(userId, [{ id, user_id: userId, ...(payload ?? {}) }])
   }
 
   async function updateRecurringSeriesRows(userId, next, { futureOnly = false } = {}) {
@@ -10914,6 +11083,7 @@ function isRightMemoMetaColumnError(error) {
           throw error
         }
       } else {
+        stagePlanRows(userId, payloads)
         return
       }
     }
@@ -10926,6 +11096,7 @@ function isRightMemoMetaColumnError(error) {
     }))
     const { error: fallbackError } = await supabase.from("plans").upsert(fallbackPayloads, { onConflict: "id" })
     if (fallbackError) throw fallbackError
+    stagePlanRows(userId, payloads)
   }
 
   function applyLegacySeriesMatch(query, target, { futureOnly = false } = {}) {
@@ -11171,7 +11342,7 @@ function isRightMemoMetaColumnError(error) {
         setAlarmEnabledForIds(userId, affectedPlanIds, nextAlarmEnabled),
         setAlarmLeadMinutesForIds(userId, affectedPlanIds, nextAlarmLeadMinutes)
       ]).catch(() => {})
-      await loadPlans(userId, { silent: true })
+      loadPlans(userId, { silent: true }).catch(() => {})
       return true
     } catch (error) {
       const message = error?.message || "Save failed."
@@ -11209,6 +11380,17 @@ function isRightMemoMetaColumnError(error) {
 
     const userId = session?.user?.id
     if (!supabase || !userId) return
+    stagePlanRows(
+      userId,
+      orderedIds.map((id, idx) => ({
+        id,
+        user_id: userId,
+        date: key,
+        sort_order: idx,
+        updated_at: new Date(baseMs + idx).toISOString(),
+        client_id: clientId || null
+      }))
+    )
     try {
       const updates = orderedIds.map((id, idx) => ({ id, order: idx }))
       await updatePlanSortOrders(userId, updates, baseMs)
@@ -11319,6 +11501,17 @@ function isRightMemoMetaColumnError(error) {
 
     const userId = session?.user?.id
     if (!supabase || !userId) return
+    stagePlanRows(
+      userId,
+      moveState.updates.map((update) => ({
+        id: update.id,
+        user_id: userId,
+        date: update.date,
+        sort_order: update.order,
+        updated_at: new Date(baseMs + update.order).toISOString(),
+        client_id: clientId || null
+      }))
+    )
     try {
       const movedPayload = {
         date: moveState.targetDate,
@@ -11351,6 +11544,21 @@ function isRightMemoMetaColumnError(error) {
       const dateKey = String(nextTarget?.date ?? "").trim()
       const legacySeriesIds = [...new Set((nextTarget?.legacy_series_ids ?? []).map((id) => String(id ?? "").trim()).filter(Boolean))]
       const legacyFutureIds = [...new Set((nextTarget?.legacy_future_ids ?? []).map((id) => String(id ?? "").trim()).filter(Boolean))]
+      const localDeleteIds = new Set(
+        (plansRef.current ?? [])
+          .filter((row) => {
+            const rowId = String(row?.id ?? "").trim()
+            if (!rowId) return false
+            const rowSeriesId = String(row?.series_id ?? row?.seriesId ?? "").trim()
+            const rowDate = String(row?.date ?? "").trim()
+            if (scope === "all" && seriesId) return rowSeriesId === seriesId
+            if (scope === "future" && seriesId) return rowSeriesId === seriesId && (!dateKey || rowDate >= dateKey)
+            if (scope === "all" && legacySeriesIds.length > 0) return legacySeriesIds.includes(rowId)
+            if (scope === "future" && legacyFutureIds.length > 0) return legacyFutureIds.includes(rowId)
+            return rowId === String(nextTarget.id)
+          })
+          .map((row) => String(row?.id ?? "").trim())
+      )
 
       let query = supabase
         .from("plans")
@@ -11389,7 +11597,17 @@ function isRightMemoMetaColumnError(error) {
         throw error
       }
 
-      await loadPlans(userId, { silent: true })
+      if (localDeleteIds.size > 0) {
+        const pending = { ...(pendingPlanWritesRef.current ?? {}) }
+        for (const id of localDeleteIds) delete pending[id]
+        pendingPlanWritesRef.current = pending
+        setPlans((prev) => {
+          const next = (prev ?? []).filter((row) => !localDeleteIds.has(String(row?.id ?? "").trim()))
+          persistPlansCache(userId, next).catch(() => {})
+          return next
+        })
+      }
+      loadPlans(userId, { silent: true }).catch(() => {})
       return true
     } catch (error) {
       setAuthMessage(error?.message || "Delete failed.")
