@@ -149,6 +149,7 @@ const PLAN_NOTIFICATION_SCHEDULE_IDS_KEY = "plannerMobile.planNotificationSchedu
 const PLAN_CACHE_KEY_PREFIX = "plannerMobile.planCache.v1"
 const RIGHT_MEMO_CACHE_KEY_PREFIX = "plannerMobile.rightMemoCache.v1"
 const PENDING_REMOTE_WRITE_TTL_MS = 10 * 60 * 1000
+const TASK_TOGGLE_COMMIT_DELAY_MS = 1000
 const PLAN_NOTIFICATION_CHANNEL_ID = "planner-reminders"
 const PLAN_NOTIFICATION_MAX_COUNT = Platform.OS === "android" ? 240 : 60
 const PLAN_NOTIFICATION_LOOKAHEAD_DAYS = Platform.OS === "android" ? 365 : 180
@@ -494,8 +495,20 @@ function stripPlanMetaSuffix(rawText) {
   }
 }
 
+function stripRedundantInlineCategoryText(value, categoryId = "") {
+  const text = String(value ?? "").trim()
+  const category = String(categoryId ?? "").trim()
+  if (!text || !category || category === "__general__") return text
+  const parts = text.split(";")
+  if (parts.length < 2) return text
+  const first = String(parts[0] ?? "").trim()
+  if (first !== `@${category}`) return text
+  return parts.slice(1).join(";").trim()
+}
+
 function getPlanDisplayText(row) {
-  return stripPlanMetaSuffix(row?.content).text
+  const stripped = stripPlanMetaSuffix(row?.content).text
+  return stripRedundantInlineCategoryText(stripped, row?.category_id)
 }
 
 function hasVisiblePlanDisplayText(row) {
@@ -546,7 +559,7 @@ function buildTaskItemFromPlanRow(row) {
   const id = String(row?.id ?? "").trim()
   const dateKey = String(row?.date ?? "").trim()
   const title = String(row?.category_id ?? "").trim()
-  const text = String(parsed.baseRaw ?? "").trim()
+  const text = stripRedundantInlineCategoryText(parsed.baseRaw, row?.category_id)
   if (!id || !dateKey || !text) return null
 
   return {
@@ -563,13 +576,31 @@ function buildTaskItemFromPlanRow(row) {
   }
 }
 
+function getTaskCompletionOverride(rowOrItem, overrides) {
+  const source = rowOrItem?.row ?? rowOrItem
+  const id = String(source?.id ?? rowOrItem?.planId ?? rowOrItem?.id ?? "").trim()
+  if (!id || !overrides || !Object.prototype.hasOwnProperty.call(overrides, id)) return null
+  return Boolean(overrides[id])
+}
+
+function getEffectiveTaskCompleted(rowOrItem, fallbackCompleted = null, overrides = null) {
+  const override = getTaskCompletionOverride(rowOrItem, overrides)
+  if (override != null) return override
+  if (fallbackCompleted != null) return Boolean(fallbackCompleted)
+  return Boolean(parsePlanMetaSuffixes((rowOrItem?.row ?? rowOrItem)?.content).completed)
+}
+
 function extractTaskItemsFromPlanRows(planRows) {
   const items = []
   for (const row of planRows ?? []) {
     const item = buildTaskItemFromPlanRow(row)
     if (item) items.push(item)
   }
-  items.sort((a, b) => {
+  return sortTaskItems(items)
+}
+
+function sortTaskItems(items) {
+  return [...(items ?? [])].sort((a, b) => {
     const dateDiff = keyToTime(a.dateKey) - keyToTime(b.dateKey)
     if (dateDiff !== 0) return dateDiff
     const timeA = String(a?.time ?? "")
@@ -579,7 +610,6 @@ function extractTaskItemsFromPlanRows(planRows) {
     if (!timeA && timeB) return 1
     return String(a?.display ?? "").localeCompare(String(b?.display ?? ""), "ko")
   })
-  return items
 }
 
 function formatPlanTimeForDisplay(row) {
@@ -781,13 +811,21 @@ function normalizeRepeatMeta(input) {
   }
 }
 
-function genSeriesId() {
+function genUuid() {
   // Keep a UUID-looking key so it works even when series_id column is uuid type.
   return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (ch) => {
     const r = Math.floor(Math.random() * 16)
     const v = ch === "x" ? r : (r & 0x3) | 0x8
     return v.toString(16)
   })
+}
+
+function genSeriesId() {
+  return genUuid()
+}
+
+function genPlanId() {
+  return genUuid()
 }
 
 function generateRecurringDateKeys({
@@ -898,6 +936,7 @@ function splitCombinedMemoText(text, windows) {
   const items = (windows ?? []).filter((w) => w && w.id !== "all")
   const titleToId = new Map(items.map((w) => [String(w.title ?? ""), String(w.id ?? "")]))
   const windowLinesById = new Map(items.map((w) => [String(w.id ?? ""), []]))
+  const touchedIds = new Set()
   let currentSection = ""
 
   const lines = String(text ?? "").split("\n")
@@ -908,6 +947,7 @@ function splitCombinedMemoText(text, windows) {
       const id = titleToId.get(title)
       if (id) {
         currentSection = id
+        touchedIds.add(id)
         const rest = String(headerMatch[2] ?? "").replace(/^\s+/, "")
         if (rest) {
           const bucket = windowLinesById.get(id) ?? []
@@ -930,7 +970,7 @@ function splitCombinedMemoText(text, windows) {
     if (!id) continue
     windowTexts[id] = (windowLinesById.get(id) ?? []).join("\n").trimEnd()
   }
-  return { windowTexts }
+  return { windowTexts, touchedIds }
 }
 
 function genRightMemoDocId() {
@@ -1565,6 +1605,14 @@ function sortItemsByTimeAndOrder(items) {
     .map((entry) => entry.row)
 }
 
+function buildDateSectionsFromMap(itemsByDate) {
+  const map = itemsByDate instanceof Map ? itemsByDate : new Map()
+  return [...map.keys()].sort().map((key) => ({
+    title: key,
+    data: map.get(key) ?? []
+  }))
+}
+
 function dedupeRowsById(rows) {
   const list = Array.isArray(rows) ? rows : []
   if (list.length <= 1) return list
@@ -2028,9 +2076,10 @@ function HeaderQuickSheet({ visible, title, hint = "", actions = [], tone = "lig
     [insets.bottom]
   )
   const actionList = useMemo(() => (Array.isArray(actions) ? actions.filter(Boolean) : []), [actions])
+  if (!visible) return null
 
   return (
-    <Modal transparent animationType="fade" visible={visible} statusBarTranslucent onRequestClose={onClose}>
+    <Modal transparent animationType="none" visible={visible} statusBarTranslucent onRequestClose={onClose}>
       <View style={styles.sheetOverlay}>
         <Pressable style={styles.sheetBackdrop} onPress={onClose} />
         <View
@@ -2271,8 +2320,10 @@ function SettingsSheet({
       onChangeTabFontScale
     ]
   )
+  if (!visible) return null
+
   return (
-    <Modal transparent animationType="fade" visible={visible} statusBarTranslucent onRequestClose={onClose}>
+    <Modal transparent animationType="none" visible={visible} statusBarTranslucent onRequestClose={onClose}>
       <View style={styles.sheetOverlay}>
         <Pressable style={styles.sheetBackdrop} onPress={onClose} />
         <View style={[styles.sheetCard, isDark ? styles.sheetCardDark : null, sheetCardStyle]}>
@@ -2413,7 +2464,17 @@ function SettingsSheet({
   )
 }
 
-function TasksSheet({ visible, tone = "light", tasks = [], onToggleTask, onOpenTask, onAddTask, onDeleteTask, onClose }) {
+function TasksSheet({
+  visible,
+  tone = "light",
+  tasks = [],
+  taskCompletionOverrides = {},
+  onToggleTask,
+  onOpenTask,
+  onAddTask,
+  onDeleteTask,
+  onClose
+}) {
   const isDark = tone === "dark"
   const insets = useSafeAreaInsets()
   const sheetBottomInset = useMemo(
@@ -2421,8 +2482,15 @@ function TasksSheet({ visible, tone = "light", tasks = [], onToggleTask, onOpenT
     [insets.bottom]
   )
   const taskList = useMemo(() => (Array.isArray(tasks) ? tasks : []), [tasks])
-  const pendingTasks = useMemo(() => taskList.filter((item) => !item?.completed), [taskList])
-  const completedTasks = useMemo(() => taskList.filter((item) => Boolean(item?.completed)), [taskList])
+  const pendingTasks = useMemo(
+    () => taskList.filter((item) => !getEffectiveTaskCompleted(item, item?.completed, taskCompletionOverrides)),
+    [taskList, taskCompletionOverrides]
+  )
+  const completedTasks = useMemo(
+    () => taskList.filter((item) => getEffectiveTaskCompleted(item, item?.completed, taskCompletionOverrides)),
+    [taskList, taskCompletionOverrides]
+  )
+  if (!visible) return null
 
   function renderDeleteAction(item) {
     if (typeof onDeleteTask !== "function") return null
@@ -2437,11 +2505,15 @@ function TasksSheet({ visible, tone = "light", tasks = [], onToggleTask, onOpenT
   }
 
   function renderTaskItem(item) {
-    const completed = Boolean(item?.completed)
+    const completed = getEffectiveTaskCompleted(item, item?.completed, taskCompletionOverrides)
     const card = (
       <View style={[styles.tasksSheetItem, isDark ? styles.tasksSheetItemDark : null]}>
         <Pressable
-          onPress={() => onToggleTask?.(item)}
+          onPressIn={(event) => {
+            event?.stopPropagation?.()
+            onToggleTask?.(item)
+          }}
+          onPress={(event) => event?.stopPropagation?.()}
           style={[
             styles.tasksSheetCheck,
             completed ? styles.tasksSheetCheckActive : null,
@@ -2510,7 +2582,7 @@ function TasksSheet({ visible, tone = "light", tasks = [], onToggleTask, onOpenT
   }
 
   return (
-    <Modal transparent animationType="fade" visible={visible} statusBarTranslucent onRequestClose={onClose}>
+    <Modal transparent animationType="none" visible={visible} statusBarTranslucent onRequestClose={onClose}>
       <GestureHandlerRootView style={styles.sheetOverlay}>
         <Pressable style={styles.sheetBackdrop} onPress={onClose} />
         <View
@@ -2993,7 +3065,7 @@ function WindowTabs({
 
       <Modal
         transparent
-        animationType="fade"
+        animationType="none"
         visible={addVisible}
         statusBarTranslucent
         onRequestClose={requestCloseAddSheet}
@@ -3048,7 +3120,7 @@ function WindowTabs({
         </View>
       </Modal>
 
-      <Modal transparent animationType="fade" visible={menuVisible} statusBarTranslucent>
+      <Modal transparent animationType="none" visible={menuVisible} statusBarTranslucent>
         <View style={styles.sheetOverlay}>
           <Pressable style={styles.sheetBackdrop} onPress={closeAll} />
           <View style={[styles.sheetCard, sheetCardStyle]}>
@@ -3075,7 +3147,7 @@ function WindowTabs({
         </View>
       </Modal>
 
-      <Modal transparent animationType="fade" visible={renameVisible} statusBarTranslucent>
+      <Modal transparent animationType="none" visible={renameVisible} statusBarTranslucent>
         <View style={styles.sheetOverlay}>
           <Pressable style={styles.sheetBackdrop} onPress={closeAll} />
           <View style={[styles.sheetCard, sheetCardStyle]}>
@@ -3113,7 +3185,7 @@ function WindowTabs({
         </View>
       </Modal>
 
-      <Modal transparent animationType="fade" visible={colorVisible} statusBarTranslucent>
+      <Modal transparent animationType="none" visible={colorVisible} statusBarTranslucent>
         <View style={styles.sheetOverlay}>
           <Pressable style={styles.sheetBackdrop} onPress={closeAll} />
           <View style={[styles.sheetCard, sheetCardStyle]}>
@@ -3174,6 +3246,7 @@ function ListScreen({
   onQuickDeletePlan,
   onTasks,
   tasksCount = 0,
+  taskCompletionOverrides = {},
   onToggleTask
 }) {
   const scale = useMemo(() => {
@@ -3237,19 +3310,19 @@ function ListScreen({
   )
   const allFilterTitles = useMemo(() => filterOptions.map((opt) => opt.title), [filterOptions])
   const isAllListFiltersSelected = allFilterTitles.length === 0 || listFilterTitles.length === allFilterTitles.length
+  const listFilterSet = useMemo(() => new Set(listFilterTitles), [listFilterTitles])
   const applyListFilter = useCallback(
     (items) => {
       const list = (Array.isArray(items) ? items : []).filter((item) => isVisibleSchedulePlanRow(item))
       if (activeTabId !== "all") return list
-      const selected = new Set(listFilterTitles)
       return list.filter((item) => {
         const category = String(item?.category_id ?? "").trim()
         if (!category || category === "__general__") return true
-        if (!selected.size) return false
-        return selected.has(category)
+        if (!listFilterSet.size) return false
+        return listFilterSet.has(category)
       })
     },
-    [activeTabId, listFilterTitles]
+    [activeTabId, listFilterSet]
   )
 
   useEffect(() => {
@@ -3764,10 +3837,11 @@ function ListScreen({
     return rows
   }, [visibleSections])
 
-  const visibleFlatListKey = useMemo(
-    () => `planner-list-${viewYear}-${viewMonth}-${listDragRefreshKey}`,
-    [listDragRefreshKey, viewMonth, viewYear]
-  )
+  const visibleFlatListKey = useMemo(() => `planner-list-${listDragRefreshKey}`, [listDragRefreshKey])
+
+  useEffect(() => {
+    listRef.current?.scrollToOffset?.({ offset: 0, animated: false })
+  }, [viewMonth, viewYear])
 
   useEffect(() => {
     const restoreOffset = pendingListScrollRestoreRef.current
@@ -4048,7 +4122,7 @@ function ListScreen({
     const time = buildPlanTimeTextFromRow(row)
     const content = getPlanDisplayText(row)
     const entryMeta = getPlanEntryMeta(row?.content)
-    const isTaskDone = Boolean(entryMeta.taskCompleted)
+    const isTaskDone = getEffectiveTaskCompleted(row, entryMeta.taskCompleted, taskCompletionOverrides)
     const category = String(row?.category_id ?? "").trim()
     const isGeneral = !category || category === "__general__"
     const categoryColor = colorByTitle.get(category) || "#94a3b8"
@@ -4097,10 +4171,11 @@ function ListScreen({
                 accessibilityRole="checkbox"
                 accessibilityState={{ checked: isTaskDone }}
                 hitSlop={6}
-                onPress={(event) => {
+                onPressIn={(event) => {
                   event?.stopPropagation?.()
                   onToggleTask?.(row)
                 }}
+                onPress={(event) => event?.stopPropagation?.()}
                 style={[
                   styles.itemTaskToggle,
                   isDark ? styles.itemTaskToggleDark : null,
@@ -4200,9 +4275,15 @@ function ListScreen({
           data={visibleFlatRows}
           keyExtractor={(row) => String(row?.id ?? "")}
           extraData={listDragRefreshKey}
-          activationDistance={6}
-          dragItemOverflow
-          animationConfig={{ damping: 20, stiffness: 220, mass: 0.35 }}
+          activationDistance={12}
+          dragItemOverflow={false}
+          autoscrollThreshold={44}
+          autoscrollSpeed={62}
+          removeClippedSubviews={false}
+          initialNumToRender={Math.max(24, Math.min(visibleFlatRows.length, 80))}
+          maxToRenderPerBatch={Math.max(24, Math.min(visibleFlatRows.length, 80))}
+          windowSize={11}
+          animationConfig={{ damping: 32, stiffness: 260, mass: 0.55, overshootClamping: true }}
           onDragBegin={(index) => {
             const row = visibleFlatRows?.[index]
             if (row?.__planRow) {
@@ -4344,7 +4425,7 @@ function ListScreen({
             const content = getPlanDisplayText(item)
             const entryMeta = getPlanEntryMeta(item?.content)
             const isTaskRow = entryMeta.entryType === "task"
-            const isTaskDone = Boolean(entryMeta.taskCompleted)
+            const isTaskDone = getEffectiveTaskCompleted(item, entryMeta.taskCompleted, taskCompletionOverrides)
             const category = String(item?.category_id ?? "").trim()
             const isGeneral = !category || category === "__general__"
             const categoryColor = colorByTitle.get(category) || "#94a3b8"
@@ -4397,10 +4478,11 @@ function ListScreen({
                           accessibilityRole="checkbox"
                           accessibilityState={{ checked: isTaskDone }}
                           hitSlop={6}
-                          onPress={(event) => {
+                          onPressIn={(event) => {
                             event?.stopPropagation?.()
                             onToggleTask?.(item)
                           }}
+                          onPress={(event) => event?.stopPropagation?.()}
                 style={[
                   styles.itemTaskToggle,
                   isDark ? styles.itemTaskToggleDark : null,
@@ -4567,7 +4649,7 @@ function ListScreen({
         transparent
         presentationStyle="overFullScreen"
         statusBarTranslucent
-        animationType="fade"
+        animationType="none"
         onRequestClose={() => setListFilterVisible(false)}
       >
         <View style={styles.dayModalOverlay}>
@@ -4689,6 +4771,12 @@ function MemoScreen({
   const isEditingRef = useRef(isEditing)
   const keyboardHeightRef = useRef(0)
   const pendingMemoLineRevealRef = useRef(null)
+  const pendingMemoRevealTimersRef = useRef([])
+  const memoRevealSeqRef = useRef(0)
+  const memoUserScrollingRef = useRef(false)
+  const memoUserScrollReleaseTimerRef = useRef(null)
+  const memoCaretRevealTimerRef = useRef(null)
+  const memoContentSelectionRef = useRef({})
   const autoSaveMemoEditRef = useRef(null)
   const finishSingleEditRef = useRef(null)
   const memoFilterInitRef = useRef(false)
@@ -4696,6 +4784,36 @@ function MemoScreen({
   const lastAppliedTabRef = useRef(activeTabId)
   const saveTimerRef = useRef(null)
   const saveSeqRef = useRef(0)
+
+  function clearMemoRevealTimers({ clearPending = true, bumpSeq = true } = {}) {
+    for (const timer of pendingMemoRevealTimersRef.current ?? []) {
+      clearTimeout(timer)
+    }
+    pendingMemoRevealTimersRef.current = []
+    if (memoCaretRevealTimerRef.current) {
+      clearTimeout(memoCaretRevealTimerRef.current)
+      memoCaretRevealTimerRef.current = null
+    }
+    if (clearPending) pendingMemoLineRevealRef.current = null
+    if (bumpSeq) memoRevealSeqRef.current += 1
+  }
+
+  function releaseMemoUserScrollSoon(delay = 180) {
+    if (memoUserScrollReleaseTimerRef.current) clearTimeout(memoUserScrollReleaseTimerRef.current)
+    memoUserScrollReleaseTimerRef.current = setTimeout(() => {
+      memoUserScrollingRef.current = false
+      memoUserScrollReleaseTimerRef.current = null
+    }, delay)
+  }
+
+  function handleMemoManualScrollStart() {
+    memoUserScrollingRef.current = true
+    clearMemoRevealTimers()
+    if (memoUserScrollReleaseTimerRef.current) {
+      clearTimeout(memoUserScrollReleaseTimerRef.current)
+      memoUserScrollReleaseTimerRef.current = null
+    }
+  }
 
   useEffect(() => {
     const prevId = prevTabRef.current
@@ -4721,15 +4839,17 @@ function MemoScreen({
       setKeyboardHeight(nextHeight)
       const pending = pendingMemoLineRevealRef.current
       if (pending) {
-        scheduleMemoPressedLineReveal(pending.targetGetter, pending.locationY, pending.options)
+        scheduleMemoPressedLineReveal(pending.targetGetter, pending.locationY, pending.options, pending.token)
       }
     })
     const hideSub = Keyboard.addListener("keyboardDidHide", () => {
       keyboardHeightRef.current = 0
-      pendingMemoLineRevealRef.current = null
+      clearMemoRevealTimers()
       setKeyboardHeight(0)
     })
     return () => {
+      clearMemoRevealTimers()
+      if (memoUserScrollReleaseTimerRef.current) clearTimeout(memoUserScrollReleaseTimerRef.current)
       showSub?.remove?.()
       hideSub?.remove?.()
     }
@@ -4831,11 +4951,12 @@ function MemoScreen({
   }
 
   async function saveForAll(text) {
-    const { windowTexts } = splitCombinedMemoText(text, windows)
+    const { windowTexts, touchedIds } = splitCombinedMemoText(text, windows)
     const targets = (windows ?? []).filter((w) => w && w.id !== "all")
     for (const w of targets) {
       const id = String(w.id ?? "")
       if (!id) continue
+      if (!touchedIds?.has?.(id)) continue
       await saveForTab(id, windowTexts?.[id] ?? "")
     }
   }
@@ -5453,10 +5574,14 @@ function MemoScreen({
   function revealMemoPressedLine(target, locationY, options = {}) {
     const scrollRef = memoAllScrollRef.current
     const yInInput = Number(locationY)
+    if (memoUserScrollingRef.current) return
     if (!scrollRef || !Number.isFinite(yInInput) || !target || typeof target?.measureInWindow !== "function") return
+    const measureDelay = Math.max(0, Number(options?.measureDelay ?? 8) || 0)
     requestAnimationFrame(() => {
       setTimeout(() => {
+        if (memoUserScrollingRef.current) return
         target.measureInWindow?.((_x, y, _w, _h) => {
+          if (memoUserScrollingRef.current) return
           const windowHeight = Dimensions.get("window").height
           const keyboardTop =
             keyboardHeightRef.current > 0 ? windowHeight - keyboardHeightRef.current : windowHeight
@@ -5473,27 +5598,181 @@ function MemoScreen({
           }
           nextY = Math.max(0, nextY)
           if (Math.abs(nextY - memoScrollYRef.current) > 1) {
-            scrollRef?.scrollTo?.({ y: nextY, animated: true })
+            memoScrollYRef.current = nextY
+            scrollRef?.scrollTo?.({ y: nextY, animated: options?.animated !== false })
           }
         })
-      }, 16)
+      }, measureDelay)
     })
   }
 
-  function scheduleMemoPressedLineReveal(targetGetter, locationY, options = {}) {
+  function scheduleMemoPressedLineReveal(targetGetter, locationY, options = {}, token = memoRevealSeqRef.current) {
     const y = Number(locationY)
     if (!Number.isFinite(y)) return
-    const delays = keyboardHeightRef.current > 0 ? [24, 120, 260] : [220, 440, 720, 1020]
-    delays.forEach((delay) => {
-      setTimeout(() => revealMemoPressedLine(targetGetter?.(), y, options), delay)
+    for (const timer of pendingMemoRevealTimersRef.current ?? []) {
+      clearTimeout(timer)
+    }
+    pendingMemoRevealTimersRef.current = []
+    const delays = keyboardHeightRef.current > 0 ? [24, 110, 220] : [140, 320, 560]
+    pendingMemoRevealTimersRef.current = delays.map((delay) =>
+      setTimeout(() => {
+        if (token !== memoRevealSeqRef.current) return
+        if (memoUserScrollingRef.current) return
+        revealMemoPressedLine(targetGetter?.(), y, options)
+      }, delay)
+    )
+    const clearTimer = setTimeout(() => {
+      if (token !== memoRevealSeqRef.current) return
+      pendingMemoLineRevealRef.current = null
+      pendingMemoRevealTimersRef.current = []
+    }, Math.max(...delays) + 120)
+    pendingMemoRevealTimersRef.current.push(clearTimer)
+  }
+
+  function getMemoLineOffsetForSelection(text, selectionIndex, verticalPadding = 0) {
+    const value = String(text ?? "")
+    const rawIndex = Number(selectionIndex)
+    if (!Number.isFinite(rawIndex)) return null
+    const index = clamp(Math.floor(rawIndex), 0, value.length)
+    const usableWidth = Math.max(120, Dimensions.get("window").width - 76)
+    const unitsPerVisualLine = Math.max(10, usableWidth / Math.max(8, memoFontSize * 0.58))
+    let visualLineIndex = 0
+    let currentLineUnits = 0
+    const beforeCursor = value.slice(0, index)
+    for (const ch of beforeCursor) {
+      if (ch === "\n") {
+        visualLineIndex += 1
+        currentLineUnits = 0
+        continue
+      }
+      if (ch === "\t") {
+        currentLineUnits += 2
+      } else if (/[\u3131-\uD79D\u3040-\u30ff\u3400-\u9fff]/u.test(ch)) {
+        currentLineUnits += 1.55
+      } else if (/\s/u.test(ch)) {
+        currentLineUnits += 0.48
+      } else {
+        currentLineUnits += 1
+      }
+      while (currentLineUnits >= unitsPerVisualLine) {
+        visualLineIndex += 1
+        currentLineUnits -= unitsPerVisualLine
+      }
+    }
+    return Math.max(0, Number(verticalPadding) || 0) + visualLineIndex * Math.max(18, Number(memoLineHeight) || 20)
+  }
+
+  function scheduleMemoCaretReveal(targetGetter, locationY, options = {}) {
+    const y = Number(locationY)
+    if (!Number.isFinite(y) || keyboardHeightRef.current <= 0 || memoUserScrollingRef.current) return
+    if (memoCaretRevealTimerRef.current) clearTimeout(memoCaretRevealTimerRef.current)
+    const delay = Math.max(0, Number(options?.delay ?? 32) || 0)
+    memoCaretRevealTimerRef.current = setTimeout(() => {
+      memoCaretRevealTimerRef.current = null
+      if (memoUserScrollingRef.current || keyboardHeightRef.current <= 0) return
+      revealMemoPressedLine(targetGetter?.(), y, options)
+    }, delay)
+  }
+
+  function getMemoContentSelectionKey(scope, key) {
+    return `${scope === "all" ? "all" : "single"}:${String(key ?? "")}`
+  }
+
+  function rememberMemoContentSelection(scope, key, selection) {
+    const start = Number(selection?.start)
+    const end = Number(selection?.end)
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return
+    memoContentSelectionRef.current[getMemoContentSelectionKey(scope, key)] = {
+      start: Math.max(0, start),
+      end: Math.max(0, end)
+    }
+  }
+
+  function getMemoContentSelection(scope, key) {
+    return memoContentSelectionRef.current?.[getMemoContentSelectionKey(scope, key)] ?? null
+  }
+
+  function isMemoContentFocused(scope, key) {
+    const focus = memoActiveInputRef.current
+    if (focus?.field !== "content") return false
+    if (scope === "all") return focus?.scope === "all" && focus?.key === String(key ?? "")
+    return focus?.scope === "single"
+  }
+
+  function getNextMemoSelectionIndex(previousText, nextText, selection) {
+    const previous = String(previousText ?? "")
+    const next = String(nextText ?? "")
+    const previousLength = previous.length
+    const nextLength = next.length
+    const rawStart = Number(selection?.start)
+    const rawEnd = Number(selection?.end)
+    const start = clamp(Number.isFinite(rawStart) ? Math.floor(rawStart) : previousLength, 0, previousLength)
+    const end = clamp(Number.isFinite(rawEnd) ? Math.floor(rawEnd) : start, start, previousLength)
+    const removedCount = Math.max(0, end - start)
+    const insertedCount = Math.max(0, nextLength - Math.max(0, previousLength - removedCount))
+    if (nextLength >= previousLength - removedCount) return clamp(start + insertedCount, 0, nextLength)
+    return clamp(start, 0, nextLength)
+  }
+
+  function revealMemoContentCaret(scope, key, text, selectionIndex, verticalPadding = 0, options = {}) {
+    if (!isMemoContentFocused(scope, key)) return
+    const y = getMemoLineOffsetForSelection(text, selectionIndex, verticalPadding)
+    if (!Number.isFinite(y)) return
+    const normalizedKey = String(key ?? "")
+    const targetGetter =
+      scope === "all" ? () => getMemoCardEditorTarget(normalizedKey, "content") : () => inputRef.current
+    scheduleMemoCaretReveal(targetGetter, y, {
+      preferredTop: 128,
+      bottomGap: 56,
+      delay: 0,
+      measureDelay: 0,
+      animated: false,
+      ...options
+    })
+  }
+
+  function queueMemoContentCaretFollow(scope, key, text, selectionIndex, verticalPadding = 0) {
+    revealMemoContentCaret(scope, key, text, selectionIndex, verticalPadding)
+    const timer = setTimeout(() => {
+      revealMemoContentCaret(scope, key, text, selectionIndex, verticalPadding)
+    }, 48)
+    pendingMemoRevealTimersRef.current.push(timer)
+  }
+
+  function handleMemoContentTextChange(scope, key, previousText, nextText, commit, verticalPadding = 0) {
+    const previous = String(previousText ?? "")
+    const next = String(nextText ?? "")
+    const selectionIndex = getNextMemoSelectionIndex(previous, next, getMemoContentSelection(scope, key))
+    rememberMemoContentSelection(scope, key, { start: selectionIndex, end: selectionIndex })
+    commit?.(next)
+    if (keyboardHeightRef.current > 0 && previous !== next) {
+      queueMemoContentCaretFollow(scope, key, next, selectionIndex, verticalPadding)
+    }
+  }
+
+  function handleMemoContentSizeChange(scope, key, text, verticalPadding = 0) {
+    const selection = getMemoContentSelection(scope, key)
+    const value = String(text ?? "")
+    const selectionIndex = Number.isFinite(Number(selection?.end)) ? Number(selection.end) : value.length
+    revealMemoContentCaret(scope, key, value, selectionIndex, verticalPadding, { delay: 0, measureDelay: 0 })
+  }
+
+  function handleMemoContentSelectionChange(scope, key, text, event, verticalPadding = 0) {
+    const selectionStart = event?.nativeEvent?.selection?.start
+    rememberMemoContentSelection(scope, key, event?.nativeEvent?.selection)
+    revealMemoContentCaret(scope, key, text, selectionStart, verticalPadding, {
+      delay: 16,
+      bottomGap: 52
     })
   }
 
   function revealMemoPressedLineSoon(targetGetter, locationY, options = {}) {
     const y = Number(locationY)
     if (!Number.isFinite(y)) return
-    pendingMemoLineRevealRef.current = { targetGetter, locationY: y, options }
-    scheduleMemoPressedLineReveal(targetGetter, y, options)
+    const token = memoRevealSeqRef.current + 1
+    memoRevealSeqRef.current = token
+    pendingMemoLineRevealRef.current = { targetGetter, locationY: y, options, token }
+    scheduleMemoPressedLineReveal(targetGetter, y, options, token)
   }
 
   function focusMemoEditorTarget(targetGetter, field = "content", attempts = 0, options = {}) {
@@ -5813,6 +6092,10 @@ function MemoScreen({
             contentContainerStyle={[styles.memoPaperContent, { paddingBottom: memoPaperBottomPadding }]}
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator
+            onScrollBeginDrag={handleMemoManualScrollStart}
+            onScrollEndDrag={() => releaseMemoUserScrollSoon(180)}
+            onMomentumScrollBegin={handleMemoManualScrollStart}
+            onMomentumScrollEnd={() => releaseMemoUserScrollSoon(120)}
             onScroll={(event) => {
               memoScrollYRef.current = event?.nativeEvent?.contentOffset?.y ?? 0
             }}
@@ -5974,12 +6257,27 @@ function MemoScreen({
                                 )
                               }}
                               onBlur={() => handleMemoCardFieldBlur(key, "content")}
-                              onChangeText={(t) => updateMemoCardDocContent(key, cardDocView.activeDocId, t)}
+                              onChangeText={(t) =>
+                                handleMemoContentTextChange(
+                                  "all",
+                                  key,
+                                  cardBody,
+                                  t,
+                                  (next) => updateMemoCardDocContent(key, cardDocView.activeDocId, next),
+                                  12
+                                )
+                              }
+                              onSelectionChange={(event) =>
+                                handleMemoContentSelectionChange("all", key, cardBody, event, 12)
+                              }
                               placeholder="내용 없음"
                               placeholderTextColor="#9aa3b2"
                               multiline
                               scrollEnabled={false}
-                              onContentSizeChange={() => syncMemoEditorViewport("all", key, "content")}
+                              onContentSizeChange={() => {
+                                syncMemoEditorViewport("all", key, "content")
+                                handleMemoContentSizeChange("all", key, cardBody, 12)
+                              }}
                               underlineColorAndroid="transparent"
                               textAlignVertical="top"
                               style={[
@@ -6200,11 +6498,37 @@ function MemoScreen({
                           autoFocus={false}
                           onFocus={() => handleSingleMemoFieldFocus("content")}
                           onBlur={() => handleSingleMemoFieldBlur("content")}
-                          onChangeText={updateSingleMemoDocContent}
+                          onChangeText={(t) =>
+                            handleMemoContentTextChange(
+                              "single",
+                              "",
+                              String(singleMemoDocView.activeDoc?.content ?? ""),
+                              t,
+                              updateSingleMemoDocContent,
+                              12
+                            )
+                          }
+                          onSelectionChange={(event) =>
+                            handleMemoContentSelectionChange(
+                              "single",
+                              "",
+                              String(singleMemoDocView.activeDoc?.content ?? ""),
+                              event,
+                              12
+                            )
+                          }
                           placeholder={placeholder}
                           multiline
                           scrollEnabled={false}
-                          onContentSizeChange={() => syncMemoEditorViewport("single", "", "content")}
+                          onContentSizeChange={() => {
+                            syncMemoEditorViewport("single", "", "content")
+                            handleMemoContentSizeChange(
+                              "single",
+                              "",
+                              String(singleMemoDocView.activeDoc?.content ?? ""),
+                              12
+                            )
+                          }}
                           disableFullscreenUI
                           underlineColorAndroid="transparent"
                           textAlignVertical="top"
@@ -6337,7 +6661,7 @@ function MemoScreen({
         transparent
         presentationStyle="overFullScreen"
         statusBarTranslucent
-        animationType="fade"
+        animationType="none"
         onRequestClose={() => setMemoFilterVisible(false)}
       >
         <View style={styles.dayModalOverlay}>
@@ -6839,13 +7163,15 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
     ])
   }
 
+  if (!visible) return null
+
   return (
     <Modal
       visible={visible}
       transparent
       presentationStyle="overFullScreen"
       statusBarTranslucent
-      animationType="fade"
+      animationType="none"
       onRequestClose={requestClose}
     >
       <View style={[styles.dayModalOverlay, isKeyboardOpen ? styles.editorOverlayKeyboard : null]}>
@@ -7038,7 +7364,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
             {isRepeatUntilActive ? (
               <View style={[styles.editorMetaRow, styles.editorRepeatMetaRow]}>
                 <Text style={[styles.editorMetaLabel, isDark ? styles.textMutedDark : null]}>반복</Text>
-                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.editorCategoryRow}>
+                <View style={styles.editorRepeatTypeRow}>
                   {repeatTypeOptions.map((opt) => {
                     const active = opt.key === repeatType
                     return (
@@ -7053,14 +7379,18 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
                           if (!repeatUntil) setRepeatUntil(date)
                         }}
                         style={[
-                          styles.editorCategoryPill,
+                          styles.editorRepeatTypePill,
+                          opt.key === "none" ? styles.editorRepeatTypePillWide : null,
                           isDark ? styles.editorCategoryPillDark : null,
                           active ? (isDark ? styles.editorCategoryPillActiveDark : styles.editorCategoryPillActive) : null
                         ]}
                       >
                         <Text
+                          numberOfLines={1}
+                          adjustsFontSizeToFit
+                          minimumFontScale={0.82}
                           style={[
-                            styles.editorCategoryText,
+                            styles.editorRepeatTypeText,
                             isDark ? styles.textDark : null,
                             active ? styles.editorCategoryTextActive : null
                           ]}
@@ -7070,7 +7400,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
                       </Pressable>
                     )
                   })}
-                </ScrollView>
+                </View>
 
                 {isRecurring ? (
                   <View style={styles.editorRepeatBlock}>
@@ -7270,11 +7600,15 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
                   }}
                   style={[
                     styles.editorAlarmLeadPill,
+                    styles.editorAlarmLeadPillNone,
                     isDark ? styles.editorAlarmLeadPillDark : null,
                     time && !alarmEnabled ? (isDark ? styles.editorAlarmLeadPillActiveDark : styles.editorAlarmLeadPillActive) : null
                   ]}
                 >
                   <Text
+                    numberOfLines={1}
+                    adjustsFontSizeToFit
+                    minimumFontScale={0.76}
                     style={[
                       styles.editorAlarmLeadText,
                       isDark ? styles.textDark : null,
@@ -7298,11 +7632,15 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
                       }}
                       style={[
                         styles.editorAlarmLeadPill,
+                        opt.key === 0 ? styles.editorAlarmLeadPillShort : null,
                         isDark ? styles.editorAlarmLeadPillDark : null,
                         active ? (isDark ? styles.editorAlarmLeadPillActiveDark : styles.editorAlarmLeadPillActive) : null
                       ]}
                     >
                       <Text
+                        numberOfLines={1}
+                        adjustsFontSizeToFit
+                        minimumFontScale={0.76}
                         style={[
                           styles.editorAlarmLeadText,
                           isDark ? styles.textDark : null,
@@ -7476,7 +7814,12 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
 
 function PickerSheet({ visible, title, value, mode, is24Hour = true, tone = "light", onCancel, onConfirm }) {
   const isDark = tone === "dark"
+  const insets = useSafeAreaInsets()
   const [temp, setTemp] = useState(value instanceof Date ? value : new Date())
+  const sheetBottomInset = useMemo(
+    () => (Platform.OS === "android" ? Math.max(insets.bottom, 16) : Math.max(insets.bottom, 22)),
+    [insets.bottom]
+  )
 
   useEffect(() => {
     if (!visible) return
@@ -7486,10 +7829,10 @@ function PickerSheet({ visible, title, value, mode, is24Hour = true, tone = "lig
   if (!visible) return null
 
   return (
-    <Modal transparent animationType="fade" presentationStyle="overFullScreen" statusBarTranslucent>
+    <Modal transparent animationType="none" presentationStyle="overFullScreen" statusBarTranslucent>
       <View style={styles.sheetOverlay}>
         <Pressable style={styles.sheetBackdrop} onPress={onCancel} />
-        <View style={[styles.sheetCard, isDark ? styles.sheetCardDark : null]}>
+        <View style={[styles.sheetCard, isDark ? styles.sheetCardDark : null, { marginBottom: sheetBottomInset }]}>
           <View style={styles.sheetHeader}>
             <Text style={[styles.sheetTitle, isDark ? styles.textDark : null]}>{title}</Text>
             <View style={styles.sheetHeaderRight}>
@@ -7520,12 +7863,24 @@ function PickerSheet({ visible, title, value, mode, is24Hour = true, tone = "lig
 
 function OptionSelectSheet({ visible, title, options = [], selectedKey, tone = "light", onSelect, onClose }) {
   const isDark = tone === "dark"
+  const insets = useSafeAreaInsets()
+  const sheetBottomInset = useMemo(
+    () => (Platform.OS === "android" ? Math.max(insets.bottom, 16) : Math.max(insets.bottom, 22)),
+    [insets.bottom]
+  )
   if (!visible) return null
   return (
-    <Modal transparent animationType="fade" presentationStyle="overFullScreen" statusBarTranslucent>
+    <Modal transparent animationType="none" presentationStyle="overFullScreen" statusBarTranslucent>
       <View style={styles.sheetOverlay}>
         <Pressable style={styles.sheetBackdrop} onPress={onClose} />
-        <View style={[styles.sheetCard, styles.choiceSheetCard, isDark ? styles.sheetCardDark : null]}>
+        <View
+          style={[
+            styles.sheetCard,
+            styles.choiceSheetCard,
+            isDark ? styles.sheetCardDark : null,
+            { marginBottom: sheetBottomInset }
+          ]}
+        >
           <View style={styles.sheetHeader}>
             <Text style={[styles.sheetTitle, isDark ? styles.textDark : null]}>{title}</Text>
             <View style={styles.sheetHeaderRight}>
@@ -7570,13 +7925,25 @@ function OptionSelectSheet({ visible, title, options = [], selectedKey, tone = "
 
 function WeekdaySelectSheet({ visible, title, labels = [], values = [], tone = "light", onToggle, onClose }) {
   const isDark = tone === "dark"
+  const insets = useSafeAreaInsets()
   const selected = useMemo(() => new Set(normalizeRepeatDays(values)), [values])
+  const sheetBottomInset = useMemo(
+    () => (Platform.OS === "android" ? Math.max(insets.bottom, 16) : Math.max(insets.bottom, 22)),
+    [insets.bottom]
+  )
   if (!visible) return null
   return (
-    <Modal transparent animationType="fade" presentationStyle="overFullScreen" statusBarTranslucent>
+    <Modal transparent animationType="none" presentationStyle="overFullScreen" statusBarTranslucent>
       <View style={styles.sheetOverlay}>
         <Pressable style={styles.sheetBackdrop} onPress={onClose} />
-        <View style={[styles.sheetCard, styles.choiceSheetCard, isDark ? styles.sheetCardDark : null]}>
+        <View
+          style={[
+            styles.sheetCard,
+            styles.choiceSheetCard,
+            isDark ? styles.sheetCardDark : null,
+            { marginBottom: sheetBottomInset }
+          ]}
+        >
           <View style={styles.sheetHeader}>
             <Text style={[styles.sheetTitle, isDark ? styles.textDark : null]}>{title}</Text>
             <View style={styles.sheetHeaderRight}>
@@ -7644,6 +8011,7 @@ function CalendarScreen({
   onSelectDateKey,
   onTasks,
   tasksCount = 0,
+  taskCompletionOverrides = {},
   onToggleTask
 }) {
   const isDark = tone === "dark"
@@ -7713,6 +8081,7 @@ function CalendarScreen({
   const calendarRootNodeRef = useRef(null)
   const calendarRootLayoutRef = useRef({ x: 0, y: 0, width: 0, height: 0 })
   const calendarDropHintRef = useRef(null)
+  const calendarLongPressTimersRef = useRef(new Set())
   const [calendarDraggingId, setCalendarDraggingId] = useState(null)
   const [calendarDragPreview, setCalendarDragPreview] = useState(null)
   const [calendarDropHint, setCalendarDropHint] = useState(null)
@@ -7738,45 +8107,63 @@ function CalendarScreen({
   )
   const allFilterTitles = useMemo(() => filterOptions.map((opt) => opt.title), [filterOptions])
   const isAllFiltersSelected = allFilterTitles.length > 0 && calendarFilterTitles.length === allFilterTitles.length
+  const calendarFilterSet = useMemo(() => new Set(calendarFilterTitles), [calendarFilterTitles])
   const applyCalendarFilter = useCallback(
     (items) => {
       const list = (Array.isArray(items) ? items : []).filter((item) => isVisibleSchedulePlanRow(item))
       if (activeTabId !== "all") return list
-      const selected = new Set(calendarFilterTitles)
       return list.filter((item) => {
         const category = String(item?.category_id ?? "").trim()
         // Keep uncategorized items visible so Calendar matches List in 통합 view.
         if (!category || category === "__general__") return true
-        if (!selected.size) return false
-        return selected.has(category)
+        if (!calendarFilterSet.size) return false
+        return calendarFilterSet.has(category)
       })
     },
-    [activeTabId, calendarFilterTitles]
+    [activeTabId, calendarFilterSet]
   )
-  const first = new Date(viewYear, viewMonth - 1, 1)
-  const startDay = first.getDay()
-  const daysInMonth = new Date(viewYear, viewMonth, 0).getDate()
-  const totalCells = startDay + daysInMonth
-  const weeks = Math.ceil(totalCells / 7)
-  const safeWeeks = Math.max(1, Number.isFinite(weeks) ? weeks : 0)
-  const cells = []
-  for (let i = 0; i < startDay; i += 1) cells.push(null)
-  for (let d = 1; d <= daysInMonth; d += 1) cells.push(d)
-  while (cells.length < weeks * 7) cells.push(null)
-
-  const weekRows = Array.from({ length: safeWeeks }, (_row, rowIndex) => cells.slice(rowIndex * 7, rowIndex * 7 + 7))
-  const calendarRowHeights = weekRows.map((week) => {
-    let maxSlots = 1
-    for (const day of week) {
-      if (!day) continue
-      const key = dateToKey(viewYear, viewMonth, day)
-      const itemCount = buildTaskOrderedRows(applyCalendarFilter(itemsByDate.get(key) ?? [])).length
-      const holidaySlots = holidaysByDate?.get?.(key) ? 1 : 0
-      maxSlots = Math.max(maxSlots, itemCount + holidaySlots, 1)
+  const weekRows = useMemo(() => {
+    const first = new Date(viewYear, viewMonth - 1, 1)
+    const startDay = first.getDay()
+    const daysInMonth = new Date(viewYear, viewMonth, 0).getDate()
+    const totalCells = startDay + daysInMonth
+    const weeks = Math.ceil(totalCells / 7)
+    const safeWeeks = Math.max(1, Number.isFinite(weeks) ? weeks : 0)
+    const cells = []
+    for (let i = 0; i < startDay; i += 1) cells.push(null)
+    for (let d = 1; d <= daysInMonth; d += 1) cells.push(d)
+    while (cells.length < safeWeeks * 7) cells.push(null)
+    return Array.from({ length: safeWeeks }, (_row, rowIndex) => cells.slice(rowIndex * 7, rowIndex * 7 + 7))
+  }, [viewMonth, viewYear])
+  const visibleCalendarItemsByDate = useMemo(() => {
+    const map = new Map()
+    for (const week of weekRows) {
+      for (const day of week) {
+        if (!day) continue
+        const key = dateToKey(viewYear, viewMonth, day)
+        map.set(key, buildTaskOrderedRows(applyCalendarFilter(itemsByDate.get(key) ?? [])))
+      }
     }
-    return Math.round(34 + maxSlots * scaleFontSize(19, calendarScale))
-  })
-  const dayItems = selectedDateKey ? applyCalendarFilter(itemsByDate.get(selectedDateKey) ?? []) : []
+    return map
+  }, [applyCalendarFilter, itemsByDate, viewMonth, viewYear, weekRows])
+  const calendarRowHeights = useMemo(
+    () =>
+      weekRows.map((week) => {
+        let maxSlots = 1
+        for (const day of week) {
+          if (!day) continue
+          const key = dateToKey(viewYear, viewMonth, day)
+          const itemCount = visibleCalendarItemsByDate.get(key)?.length ?? 0
+          const holidaySlots = holidaysByDate?.get?.(key) ? 1 : 0
+          maxSlots = Math.max(maxSlots, itemCount + holidaySlots, 1)
+        }
+        return Math.round(34 + maxSlots * scaleFontSize(19, calendarScale))
+      }),
+    [calendarScale, holidaysByDate, viewMonth, viewYear, visibleCalendarItemsByDate, weekRows]
+  )
+  const dayItems = selectedDateKey
+    ? visibleCalendarItemsByDate.get(selectedDateKey) ?? buildTaskOrderedRows(applyCalendarFilter(itemsByDate.get(selectedDateKey) ?? []))
+    : []
   const dayModalItems = useMemo(
     () => (dayReorderMode ? dayReorderItems : buildTaskGroupedListRows(sortItemsByTimeAndOrder(dayItems), selectedDateKey)),
     [dayItems, dayReorderItems, dayReorderMode, selectedDateKey]
@@ -7789,7 +8176,7 @@ function CalendarScreen({
     const [y, m, d] = String(selectedDateKey).split("-")
     return `${y}.${m}.${d}${dayName ? ` (${dayName})` : ""}`
   }, [selectedDateKey])
-  const dayModalCount = dayReorderMode ? dayReorderItems.length : dayItems.length
+  const dayModalCount = dayItems.length
 
   function moveDayItem(list, fromIndex, toIndex) {
     const safe = Array.isArray(list) ? list : []
@@ -7809,6 +8196,22 @@ function CalendarScreen({
       if (left[i] !== right[i]) return false
     }
     return true
+  }
+
+  function dayRowsSignature(rows) {
+    return (Array.isArray(rows) ? rows : [])
+      .map((row) =>
+        [
+          String(row?.id ?? ""),
+          String(row?.content ?? ""),
+          String(row?.date ?? ""),
+          String(row?.time ?? ""),
+          String(row?.end_time ?? row?.endTime ?? ""),
+          String(row?.category_id ?? ""),
+          String(row?.sort_order ?? row?.sortOrder ?? row?.order ?? "")
+        ].join("\u001f")
+      )
+      .join("\u001e")
   }
 
   function hasPendingDayReorderChanges() {
@@ -7871,6 +8274,33 @@ function CalendarScreen({
     setDayReorderSaving(false)
   }
 
+  async function handleDayModalDragEnd(data) {
+    const dateKey = String(selectedDateKey ?? "").trim()
+    const next = enforceTimedPlanOrderInSlots(Array.isArray(data) ? data : [])
+    const nextIds = next.map((row) => String(row?.id ?? "").trim()).filter(Boolean)
+    dayReorderItemsRef.current = next
+    setDayReorderItems(next)
+    setDayDraggingId(null)
+
+    if (!onReorderNoTime || !dateKey || nextIds.length === 0 || dayIdsEqual(nextIds, dayReorderOriginalIdsRef.current)) {
+      setTimeout(() => {
+        daySuppressPressRef.current = false
+      }, 120)
+      return
+    }
+
+    setDayReorderSaving(true)
+    try {
+      await onReorderNoTime?.(dateKey, next)
+      dayReorderOriginalIdsRef.current = nextIds
+    } finally {
+      setDayReorderSaving(false)
+      setTimeout(() => {
+        daySuppressPressRef.current = false
+      }, 120)
+    }
+  }
+
   function quickDeleteFromDayReorder(item) {
     if (!item || !onQuickDeletePlan) return
     Alert.alert("일정 삭제", "이 항목을 삭제할까요?", [
@@ -7916,18 +8346,55 @@ function CalendarScreen({
   }, [selectedDateKey])
 
   useEffect(() => {
-    if (!selectedDateKey || dayReorderMode) return
+    if (!selectedDateKey || dayDraggingId) return
     const sorted = sortItemsByTimeAndOrder(dayItems)
     const nextIds = sorted.map((item) => String(item?.id ?? "").trim()).filter(Boolean)
-    const currentIds = (dayReorderItemsRef.current ?? []).map((item) => String(item?.id ?? "").trim()).filter(Boolean)
-    if (dayIdsEqual(nextIds, currentIds)) return
-    setDayReorderItems(sorted)
-    dayReorderItemsRef.current = sorted
-  }, [selectedDateKey, dayItems, dayReorderMode])
+    const currentRows = Array.isArray(dayReorderItemsRef.current) ? dayReorderItemsRef.current : []
+    const currentIds = currentRows.map((item) => String(item?.id ?? "").trim()).filter(Boolean)
+    if (!dayIdsEqual(nextIds, currentIds)) {
+      setDayReorderItems(sorted)
+      dayReorderItemsRef.current = sorted
+    } else {
+      const rowById = new Map(sorted.map((item) => [String(item?.id ?? "").trim(), item]))
+      const refreshed = currentRows.map((item) => {
+        const id = String(item?.id ?? "").trim()
+        const latest = id ? rowById.get(id) : null
+        return latest ? { ...(item ?? {}), ...(latest ?? {}) } : item
+      })
+      if (dayRowsSignature(refreshed) !== dayRowsSignature(currentRows)) {
+        setDayReorderItems(refreshed)
+        dayReorderItemsRef.current = refreshed
+      }
+    }
+    dayReorderOriginalIdsRef.current = nextIds
+  }, [selectedDateKey, dayItems, dayDraggingId])
 
   useEffect(() => {
     ensureHolidayYear?.(viewYear)
   }, [viewYear, ensureHolidayYear])
+
+  function clearCalendarLongPressTimers() {
+    for (const timer of calendarLongPressTimersRef.current ?? []) {
+      clearTimeout(timer)
+    }
+    calendarLongPressTimersRef.current?.clear?.()
+  }
+
+  function resetCalendarDragInteraction({ clearSuppress = true } = {}) {
+    clearCalendarLongPressTimers()
+    calendarDragStateRef.current = null
+    setCalendarDraggingId(null)
+    hideCalendarBlockDragPreview()
+    clearCalendarDropHint()
+    if (clearSuppress) daySuppressPressRef.current = false
+  }
+
+  useFocusEffect(
+    useCallback(() => {
+      resetCalendarDragInteraction()
+      return () => resetCalendarDragInteraction()
+    }, [])
+  )
 
   useEffect(() => {
     if (activeTabId === "all") return
@@ -8132,9 +8599,9 @@ function CalendarScreen({
       }
       return index
     }
-    const items = buildTaskOrderedRows(applyCalendarFilter(itemsByDate.get(key) ?? [])).filter(
-      (row) => String(row?.id ?? "").trim() !== String(movingId ?? "")
-    )
+    const items = (
+      visibleCalendarItemsByDate.get(key) ?? buildTaskOrderedRows(applyCalendarFilter(itemsByDate.get(key) ?? []))
+    ).filter((row) => String(row?.id ?? "").trim() !== String(movingId ?? ""))
     return items.length
   }
 
@@ -8300,6 +8767,7 @@ function CalendarScreen({
     const clearLongPressTimer = () => {
       if (!longPressTimer) return
       clearTimeout(longPressTimer)
+      calendarLongPressTimersRef.current?.delete?.(longPressTimer)
       longPressTimer = null
     }
     const getDragState = () => {
@@ -8317,6 +8785,7 @@ function CalendarScreen({
     const activateDrag = (evt, gesture = {}) => {
       const current = getDragState()
       if (current?.activated) return current
+      if (current?.tapCancelled) return current
       const blocked = !isMovableNoTimePlanRow(item)
       daySuppressPressRef.current = true
       const activatedState = patchDragState({ activated: true, blocked })
@@ -8346,17 +8815,13 @@ function CalendarScreen({
       onStartShouldSetPanResponder: () => true,
       onStartShouldSetPanResponderCapture: () => false,
       onMoveShouldSetPanResponder: (_evt, gesture) => {
-        const distance = Math.max(Math.abs(gesture.dx), Math.abs(gesture.dy))
-        return Boolean(getDragState()?.activated) || distance > 4
+        return Boolean(getDragState()?.activated)
       },
       onMoveShouldSetPanResponderCapture: (_evt, gesture) => {
-        const distance = Math.max(Math.abs(gesture.dx), Math.abs(gesture.dy))
-        return Boolean(getDragState()?.activated) || distance > 4
+        return Boolean(getDragState()?.activated)
       },
       onPanResponderGrant: (evt) => {
         const startPoint = getResponderScreenPoint(evt)
-        void measureCalendarLayoutsNow()
-        const sourceLayout = calendarItemLayoutsRef.current?.[id] ?? null
         calendarDragStateRef.current = {
           id,
           item,
@@ -8364,24 +8829,27 @@ function CalendarScreen({
           activated: false,
           didMove: false,
           blocked: false,
+          tapCancelled: false,
           startPoint,
           latestPoint: startPoint,
-          sourceLayout
+          sourceLayout: calendarItemLayoutsRef.current?.[id] ?? null
         }
-        refreshCalendarItemLayout(id, { patchDragState: true })
         clearLongPressTimer()
         longPressTimer = setTimeout(() => {
+          calendarLongPressTimersRef.current?.delete?.(longPressTimer)
           activateDrag(null)
-        }, 180)
+        }, 360)
+        calendarLongPressTimersRef.current?.add?.(longPressTimer)
       },
       onPanResponderMove: (evt, gesture) => {
         const point = getResponderScreenPoint(evt, gesture, { preferGesture: true })
         if (point.pageX || point.pageY) patchDragState({ latestPoint: point })
         const current = getDragState()
         const distance = Math.max(Math.abs(gesture.dx), Math.abs(gesture.dy))
-        if (!current?.activated && distance > 6) {
+        if (!current?.activated && distance > 14) {
           clearLongPressTimer()
-          activateDrag(evt, gesture)
+          patchDragState({ tapCancelled: true })
+          return
         }
         const activeState = getDragState()
         if (!activeState?.activated) return
@@ -8408,13 +8876,20 @@ function CalendarScreen({
         const finalDropHint = calendarDropHintRef.current
         const gestureDistance = Math.max(Math.abs(Number(gesture?.dx) || 0), Math.abs(Number(gesture?.dy) || 0))
         const shouldTreatAsDrag = Boolean(releaseState?.activated || releaseState?.didMove || calendarDraggingId === id)
-        setCalendarDraggingId(null)
-        hideCalendarBlockDragPreview()
-        clearCalendarDropHint()
+        resetCalendarDragInteraction({ clearSuppress: false })
+        if (releaseState?.tapCancelled && !releaseState?.activated) {
+          setTimeout(() => {
+            daySuppressPressRef.current = false
+          }, 80)
+          return
+        }
         if (!shouldTreatAsDrag) {
           daySuppressPressRef.current = true
-          onEditPlan?.(item)
-          calendarDragStateRef.current = null
+          resetCalendarDragInteraction({ clearSuppress: false })
+          if (dateKey) {
+            onSelectDateKey?.(dateKey)
+            setSelectedDateKey(dateKey)
+          }
           setTimeout(() => {
             daySuppressPressRef.current = false
           }, 120)
@@ -8422,14 +8897,12 @@ function CalendarScreen({
         }
         if (releaseState?.blocked) {
           showDayMoveBlockedAlert(item)
-          calendarDragStateRef.current = null
           setTimeout(() => {
             daySuppressPressRef.current = false
           }, 180)
           return
         }
         if (!releaseState?.didMove && gestureDistance <= 2) {
-          calendarDragStateRef.current = null
           setTimeout(() => {
             daySuppressPressRef.current = false
           }, 120)
@@ -8443,17 +8916,13 @@ function CalendarScreen({
         if (target?.dateKey) {
           void Promise.resolve(onMovePlan?.(item, target.dateKey, target.index)).catch(() => {})
         }
-        calendarDragStateRef.current = null
         setTimeout(() => {
           daySuppressPressRef.current = false
         }, 120)
       },
       onPanResponderTerminate: () => {
         clearLongPressTimer()
-        setCalendarDraggingId(null)
-        hideCalendarBlockDragPreview()
-        clearCalendarDropHint()
-        calendarDragStateRef.current = null
+        resetCalendarDragInteraction({ clearSuppress: false })
         setTimeout(() => {
           daySuppressPressRef.current = false
         }, 120)
@@ -8467,7 +8936,7 @@ function CalendarScreen({
     if (!day) return
     const key = dateToKey(viewYear, viewMonth, day)
     onSelectDateKey?.(key)
-    onAddPlan?.(key)
+    setSelectedDateKey(key)
   }
 
   function goToday() {
@@ -8502,12 +8971,17 @@ function CalendarScreen({
       )
     }
     const { rowKey, onPress, onLongPress, onDelete, draggable = false, isActive = false } = options
-    const time = buildPlanTimeTextFromRow(item)
-    const content = getPlanDisplayText(item)
-    const entryMeta = getPlanEntryMeta(item?.content)
+    const itemIdForLookup = String(item?.id ?? "").trim()
+    const latestItem =
+      itemIdForLookup && Array.isArray(dayItems)
+        ? dayItems.find((row) => String(row?.id ?? "").trim() === itemIdForLookup) ?? item
+        : item
+    const time = buildPlanTimeTextFromRow(latestItem)
+    const content = getPlanDisplayText(latestItem)
+    const entryMeta = getPlanEntryMeta(latestItem?.content)
     const isTaskRow = entryMeta.entryType === "task"
-    const isTaskDone = Boolean(entryMeta.taskCompleted)
-    const category = String(item?.category_id ?? "").trim()
+    const isTaskDone = getEffectiveTaskCompleted(latestItem, entryMeta.taskCompleted, taskCompletionOverrides)
+    const category = String(latestItem?.category_id ?? "").trim()
     const isGeneral = !category || category === "__general__"
     const categoryColor = colorByTitle.get(category) || "#94a3b8"
     const canLongPress = typeof onLongPress === "function"
@@ -8542,10 +9016,18 @@ function CalendarScreen({
                 accessibilityRole="checkbox"
                 accessibilityState={{ checked: isTaskDone }}
                 hitSlop={6}
-                onPress={(event) => {
+                onPressIn={(event) => {
                   daySuppressPressRef.current = true
                   event?.stopPropagation?.()
-                  onToggleTask?.(item)
+                  event?.preventDefault?.()
+                  onToggleTask?.(latestItem, { source: "day-modal" })
+                  setTimeout(() => {
+                    daySuppressPressRef.current = false
+                  }, 320)
+                }}
+                onPress={(event) => {
+                  event?.stopPropagation?.()
+                  event?.preventDefault?.()
                 }}
               style={[
                 styles.itemTaskToggle,
@@ -8556,7 +9038,7 @@ function CalendarScreen({
                 isTaskDone ? { backgroundColor: colorWithAlpha(categoryColor, 0.16), borderColor: categoryColor } : null
               ]}
               >
-                {renderTaskMarkerContent(item, isTaskDone, isDark)}
+                {renderTaskMarkerContent(latestItem, isTaskDone, isDark)}
               </Pressable>
             ) : null}
             <Text
@@ -8691,8 +9173,7 @@ function CalendarScreen({
                   >
                     {week.map((day, col) => {
                       const key = day ? dateToKey(viewYear, viewMonth, day) : null
-                      const rawItems = key ? itemsByDate.get(key) ?? [] : []
-                      const items = buildTaskOrderedRows(applyCalendarFilter(rawItems))
+                      const items = key ? visibleCalendarItemsByDate.get(key) ?? [] : []
                       const holidayName = key ? holidaysByDate?.get?.(key) ?? "" : ""
                       const holidayLabel = holidayName ? String(holidayName).trim() : ""
                       const isHoliday = Boolean(holidayName)
@@ -8700,7 +9181,6 @@ function CalendarScreen({
                       const isSaturday = col === 6
                       const isLastCol = col === 6
                       const isToday = key === todayKey
-                      const isSelected = key && key === selectedDateKey
                       const isDropTarget = Boolean(calendarDraggingId && key && calendarDropHint?.dateKey === key)
                       const dropBaseCount = isDropTarget
                         ? items.filter((row) => String(row?.id ?? "").trim() !== String(calendarDraggingId ?? "")).length
@@ -8713,6 +9193,7 @@ function CalendarScreen({
                         <Pressable
                           key={`${row}-${col}-${day ?? "x"}`}
                           ref={(node) => (key ? measureCalendarCell(key, node) : null)}
+                          disabled={!day}
                           style={[
                             styles.calendarCell,
                             isDark ? styles.calendarCellDark : null,
@@ -8720,7 +9201,6 @@ function CalendarScreen({
                             isLastCol ? styles.calendarCellLastCol : null,
                             isLastRow ? styles.calendarCellLastRow : null,
                             isToday ? (isDark ? styles.calendarCellTodayDark : styles.calendarCellToday) : null,
-                            isSelected ? (isDark ? styles.calendarCellSelectedDark : styles.calendarCellSelected) : null,
                             isDropTarget ? (isDark ? styles.calendarCellDropTargetDark : styles.calendarCellDropTarget) : null
                           ]}
                           onPress={() => {
@@ -8731,7 +9211,12 @@ function CalendarScreen({
                             openDate(day)
                           }}
                         >
-                          {isToday ? <View style={[styles.calendarTodayOutline, isDark ? styles.calendarTodayOutlineDark : null]} /> : null}
+                          {isToday ? (
+                            <View
+                              pointerEvents="none"
+                              style={[styles.calendarTodayOutline, isDark ? styles.calendarTodayOutlineDark : null]}
+                            />
+                          ) : null}
                           {isDropTarget ? (
                             <View
                               pointerEvents="none"
@@ -8752,7 +9237,6 @@ function CalendarScreen({
                                 isSunday ? styles.calendarDaySunday : null,
                                 isSaturday ? styles.calendarDaySaturday : null,
                                 isToday ? (isDark ? styles.calendarDayTodayDark : styles.calendarDayToday) : null,
-                                isSelected ? (isDark ? styles.calendarDaySelectedDark : styles.calendarDaySelected) : null,
                                 isHoliday ? styles.calendarDayHoliday : null
                               ]}
                             >
@@ -8777,7 +9261,7 @@ function CalendarScreen({
                               const line = formatLine(item)
                               const entryMeta = getPlanEntryMeta(item?.content)
                               const isTaskLine = entryMeta.entryType === "task"
-                              const isTaskDone = Boolean(entryMeta.taskCompleted)
+                              const isTaskDone = getEffectiveTaskCompleted(item, entryMeta.taskCompleted, taskCompletionOverrides)
                               const category = String(item?.category_id ?? "").trim()
                               const dotColor =
                                 category && category !== "__general__"
@@ -8812,14 +9296,19 @@ function CalendarScreen({
                                         <Pressable
                                           accessibilityRole="checkbox"
                                           accessibilityState={{ checked: isTaskDone }}
-                                          hitSlop={6}
-                                          onPress={(event) => {
+                                          hitSlop={10}
+                                          onPressIn={(event) => {
                                             event?.stopPropagation?.()
+                                            event?.preventDefault?.()
                                             daySuppressPressRef.current = true
-                                            onToggleTask?.(item)
+                                            onToggleTask?.(item, { source: "calendar" })
                                             setTimeout(() => {
                                               daySuppressPressRef.current = false
-                                            }, 120)
+                                            }, 320)
+                                          }}
+                                          onPress={(event) => {
+                                            event?.stopPropagation?.()
+                                            event?.preventDefault?.()
                                           }}
                                           style={[
                                             styles.calendarTaskMarker,
@@ -8870,7 +9359,7 @@ function CalendarScreen({
         transparent
         presentationStyle="overFullScreen"
         statusBarTranslucent
-        animationType="fade"
+        animationType="none"
         onRequestClose={() => setCalendarFilterVisible(false)}
       >
         <View style={styles.dayModalOverlay}>
@@ -8931,7 +9420,7 @@ function CalendarScreen({
         const line = formatLine(previewItem)
         const entryMeta = getPlanEntryMeta(previewItem?.content)
         const isTaskLine = entryMeta.entryType === "task"
-        const isTaskDone = Boolean(entryMeta.taskCompleted)
+        const isTaskDone = getEffectiveTaskCompleted(previewItem, entryMeta.taskCompleted, taskCompletionOverrides)
         const category = String(previewItem?.category_id ?? "").trim()
         const dotColor =
           category && category !== "__general__"
@@ -9007,7 +9496,7 @@ function CalendarScreen({
         transparent
         presentationStyle="overFullScreen"
         statusBarTranslucent
-        animationType="fade"
+        animationType="none"
         onRequestClose={closeDayModal}
       >
         <GestureHandlerRootView style={styles.dayModalOverlay}>
@@ -9021,119 +9510,81 @@ function CalendarScreen({
                 </View>
               </View>
               <View style={styles.dayModalHeaderRight}>
-                {dayReorderMode ? (
-                  <Pressable
-                    onPress={closeDayReorderModeWithSave}
-                    style={[styles.dayModalAddBtn, isDark ? styles.dayModalAddBtnDark : null]}
-                    disabled={dayReorderSaving}
-                  >
-                    <Text style={styles.dayModalAddText}>{dayReorderSaving ? "저장중" : "완료"}</Text>
-                  </Pressable>
-                ) : (
-                  <>
-                    <Pressable
-                      onPress={() => {
-                        if (!selectedDateKey) return
-                        onAddPlan?.(selectedDateKey)
-                      }}
-                      style={[styles.dayModalAddBtn, isDark ? styles.dayModalAddBtnDark : null]}
-                    >
-                      <Text style={styles.dayModalAddText}>+ 추가</Text>
-                    </Pressable>
-                    {onReorderNoTime && dayItems.length > 1 && dayItems.some((item) => isMovableNoTimePlanRow(item)) ? (
-                      <Pressable
-                        onPress={() => openDayReorder(dayItems)}
-                        style={[styles.dayModalAddBtn, isDark ? styles.dayModalAddBtnDark : null]}
-                      >
-                        <Text style={styles.dayModalAddText}>정렬</Text>
-                      </Pressable>
-                    ) : null}
-                    <Pressable onPress={closeDayModal} style={[styles.dayModalCloseBtn, isDark ? styles.dayModalCloseBtnDark : null]}>
-                      <Text style={[styles.dayModalCloseX, isDark ? styles.textDark : null]}>닫기</Text>
-                    </Pressable>
-                  </>
-                )}
+                <Pressable
+                  onPress={() => {
+                    if (!selectedDateKey) return
+                    onAddPlan?.(selectedDateKey)
+                  }}
+                  style={[styles.dayModalAddBtn, isDark ? styles.dayModalAddBtnDark : null]}
+                >
+                  <Text style={styles.dayModalAddText}>+ 추가</Text>
+                </Pressable>
+                {dayReorderSaving ? (
+                  <View style={[styles.dayModalAddBtn, isDark ? styles.dayModalAddBtnDark : null]}>
+                    <Text style={styles.dayModalAddText}>저장중</Text>
+                  </View>
+                ) : null}
+                <Pressable onPress={closeDayModal} style={[styles.dayModalCloseBtn, isDark ? styles.dayModalCloseBtnDark : null]}>
+                  <Text style={[styles.dayModalCloseX, isDark ? styles.textDark : null]}>닫기</Text>
+                </Pressable>
               </View>
             </View>
-            {dayReorderMode ? (
-              dayReorderItems.length === 0 ? (
-                <View style={styles.dayModalEmpty}>
-                  <Text style={[styles.dayModalEmptyTitle, isDark ? styles.textDark : null]}>할 일이 없어요</Text>
-                  <Text style={[styles.dayModalEmptySub, isDark ? styles.textMutedDark : null]}>이 날짜에 등록된 일정이 없습니다.</Text>
-                </View>
-              ) : (
-                <ScrollView contentContainerStyle={styles.dayModalList} scrollEnabled={!dayDraggingId}>
-                  <DraggableFlatList
-                    data={dayReorderItems}
-                    keyExtractor={(row, idx) => String(row?.id ?? `${row?.date}-${row?.content}-${idx}`)}
-                    activationDistance={6}
-                    scrollEnabled={false}
-                    nestedScrollEnabled={false}
-                    containerStyle={styles.reorderNoTimeList}
-                    animationConfig={{ damping: 20, stiffness: 220, mass: 0.35 }}
-                    onDragBegin={(index) => {
-                      const row = dayReorderItemsRef.current?.[index]
-                      setDayDraggingId(String(row?.id ?? "__drag__"))
-                    }}
-                    onDragEnd={({ data }) => {
-                      const next = enforceTimedPlanOrderInSlots(Array.isArray(data) ? data : [])
-                      dayReorderItemsRef.current = next
-                      setDayReorderItems(next)
-                      setDayDraggingId(null)
-                    }}
-                    renderItem={({ item, drag, isActive }) => {
-                      const movable = isMovableNoTimePlanRow(item)
-                      const canDelete = movable && !isRecurringPlanRowForMove(item)
-                      return renderDayModalRow(item, {
-                        rowKey: String(item?.id ?? `${item?.date}-${item?.content}`),
-                        draggable: movable,
-                        isActive,
-                        onLongPress: movable ? drag : () => showDayMoveBlockedAlert(item),
-                        onDelete: canDelete ? () => quickDeleteFromDayReorder(item) : undefined
-                      })
-                    }}
-                  />
-                </ScrollView>
-              )
+            {dayReorderItems.length === 0 ? (
+              <View style={styles.dayModalEmpty}>
+                <Text style={[styles.dayModalEmptyTitle, isDark ? styles.textDark : null]}>할 일이 없어요</Text>
+                <Text style={[styles.dayModalEmptySub, isDark ? styles.textMutedDark : null]}>이 날짜에 등록된 일정이 없습니다.</Text>
+              </View>
             ) : (
-              <ScrollView contentContainerStyle={styles.dayModalList} scrollEnabled={!dayDraggingId}>
-                {dayItems.length === 0 ? (
-                  <View style={styles.dayModalEmpty}>
-                    <Text style={[styles.dayModalEmptyTitle, isDark ? styles.textDark : null]}>할 일이 없어요</Text>
-                    <Text style={[styles.dayModalEmptySub, isDark ? styles.textMutedDark : null]}>이 날짜에 등록된 일정이 없습니다.</Text>
-                  </View>
-                ) : (
-                  dayModalItems.map((item) => {
-                    const itemId = String(item?.id ?? "").trim()
-                    const canReorder = !item?.__taskDivider && !item?.__bucketDivider && Boolean(onReorderNoTime && itemId)
-                    const handlePress = () => {
-                      if (daySuppressPressRef.current) {
+              <DraggableFlatList
+                data={dayReorderItems}
+                keyExtractor={(row, idx) => String(row?.id ?? `${row?.date}-${row?.content}-${idx}`)}
+                activationDistance={8}
+                dragItemOverflow={false}
+                scrollEnabled={!dayDraggingId}
+                nestedScrollEnabled
+                containerStyle={styles.reorderNoTimeList}
+                contentContainerStyle={styles.dayModalList}
+                animationConfig={{ damping: 24, stiffness: 230, mass: 0.45, overshootClamping: true }}
+                onDragBegin={(index) => {
+                  const row = dayReorderItemsRef.current?.[index]
+                  daySuppressPressRef.current = true
+                  setDayDraggingId(String(row?.id ?? "__drag__"))
+                }}
+                onDragEnd={({ data }) => {
+                  void handleDayModalDragEnd(data)
+                }}
+                renderItem={({ item, drag, isActive }) => {
+                  const itemId = String(item?.id ?? "").trim()
+                  const movable = Boolean(onReorderNoTime && itemId && isMovableNoTimePlanRow(item))
+                  const handlePress = () => {
+                    if (daySuppressPressRef.current) {
+                      daySuppressPressRef.current = false
+                      return
+                    }
+                    resetCalendarDragInteraction()
+                    onEditPlan?.(item)
+                  }
+                  const handleLongPress = () => {
+                    if (!onReorderNoTime || !itemId) return
+                    daySuppressPressRef.current = true
+                    if (!movable) {
+                      showDayMoveBlockedAlert(item)
+                      setTimeout(() => {
                         daySuppressPressRef.current = false
-                        return
-                      }
-                      if (item?.__taskDivider || item?.__bucketDivider) return
-                      onEditPlan?.(item)
+                      }, 350)
+                      return
                     }
-                    const handleLongPress = () => {
-                      if (!canReorder) return
-                      daySuppressPressRef.current = true
-                      if (!isMovableNoTimePlanRow(item)) {
-                        showDayMoveBlockedAlert(item)
-                        setTimeout(() => {
-                          daySuppressPressRef.current = false
-                        }, 350)
-                        return
-                      }
-                      openDayReorder(dayItems)
-                    }
-                    return renderDayModalRow(item, {
-                      rowKey: item.id ?? `${item.date}-${item.content}-${item?.__taskDivider ? "divider" : "row"}`,
-                      onPress: handlePress,
-                      onLongPress: canReorder ? handleLongPress : undefined
-                    })
+                    drag?.()
+                  }
+                  return renderDayModalRow(item, {
+                    rowKey: item.id ?? `${item.date}-${item.content}`,
+                    onPress: handlePress,
+                    onLongPress: handleLongPress,
+                    draggable: movable,
+                    isActive
                   })
-                )}
-              </ScrollView>
+                }}
+              />
             )}
           </View>
         </GestureHandlerRootView>
@@ -9223,9 +9674,11 @@ function AppInner() {
   const [plans, setPlans] = useState([])
   const [alarmDisabledByPlanId, setAlarmDisabledByPlanId] = useState({})
   const [alarmLeadByPlanId, setAlarmLeadByPlanId] = useState({})
+  const [taskCompletionOverrides, setTaskCompletionOverrides] = useState({})
   const [windows, setWindows] = useState(DEFAULT_WINDOWS)
   const [activeTabId, setActiveTabId] = useState("all")
   const [rightMemos, setRightMemos] = useState({})
+  const rightMemosRef = useRef({})
   const [loading, setLoading] = useState(false)
   const [holidaysByDate, setHolidaysByDate] = useState(() => new Map())
   const holidayYearCacheRef = useRef(new Map())
@@ -9255,15 +9708,40 @@ function AppInner() {
   const rightMemosLoadSeqRef = useRef(0)
   const rightMemoMetaColumnsSupportedRef = useRef(true)
   const pendingPlanWritesRef = useRef({})
+  const pendingPlanDeletesRef = useRef({})
   const pendingRightMemoWritesRef = useRef({})
+  const planWriteQueueRef = useRef({})
+  const planOrderWriteQueueRef = useRef(Promise.resolve())
+  const rightMemoWriteQueueRef = useRef({})
+  const rightMemoWriteSeqRef = useRef({})
+  const taskToggleSeqRef = useRef({})
+  const taskToggleWriteQueueRef = useRef({})
+  const taskToggleTouchGuardRef = useRef({})
+  const taskToggleCommitTimersRef = useRef({})
+  const plansCachePersistTimerRef = useRef(null)
   const appStateRef = useRef(AppState.currentState)
   const plansRef = useRef([])
 
   const memoYear = new Date().getFullYear()
 
   useEffect(() => {
+    return () => {
+      if (plansCachePersistTimerRef.current) clearTimeout(plansCachePersistTimerRef.current)
+      for (const entry of Object.values(taskToggleCommitTimersRef.current ?? {})) {
+        if (entry?.timer) clearTimeout(entry.timer)
+        entry?.commit?.()
+      }
+      taskToggleCommitTimersRef.current = {}
+    }
+  }, [])
+
+  useEffect(() => {
     setTasksVisible(false)
   }, [activeTabId, activeScreen])
+
+  useEffect(() => {
+    rightMemosRef.current = rightMemos ?? {}
+  }, [rightMemos])
 
   async function fetchHolidayYear(year) {
     const res = await fetch(`https://date.nager.at/api/v3/PublicHolidays/${year}/KR`)
@@ -9361,6 +9839,16 @@ function AppInner() {
     }
   }
 
+  function schedulePlansCachePersist(userId, rows, delay = 180) {
+    if (!userId) return
+    if (plansCachePersistTimerRef.current) clearTimeout(plansCachePersistTimerRef.current)
+    const snapshot = Array.isArray(rows) ? rows : []
+    plansCachePersistTimerRef.current = setTimeout(() => {
+      plansCachePersistTimerRef.current = null
+      persistPlansCache(userId, snapshot).catch(() => {})
+    }, delay)
+  }
+
   async function readRightMemosCacheEntry(userId, year) {
     if (!userId) return { items: {}, savedAt: 0 }
     try {
@@ -9391,21 +9879,120 @@ function AppInner() {
     }
   }
 
-  function mergePendingPlanWrites(rows) {
+  function mergePendingRightMemoWrites(baseItems, options = {}) {
+    const shouldConfirmMatches = Boolean(options?.confirmMatches)
+    const map = { ...(baseItems ?? {}) }
+    const now = Date.now()
+    const pending = { ...(pendingRightMemoWritesRef.current ?? {}) }
+    let pendingChanged = false
+    for (const [id, entry] of Object.entries(pending)) {
+      const key = String(id ?? "").trim()
+      if (!key || !entry || typeof entry !== "object") {
+        delete pending[id]
+        pendingChanged = true
+        continue
+      }
+      const expiresAt = Number(entry.expiresAt ?? 0)
+      const value = String(entry.value ?? "")
+      const loadedValue = String(map[key] ?? "")
+      if ((shouldConfirmMatches && loadedValue === value) || (expiresAt > 0 && now >= expiresAt)) {
+        delete pending[key]
+        pendingChanged = true
+        continue
+      }
+      map[key] = value
+    }
+    if (pendingChanged) pendingRightMemoWritesRef.current = pending
+    return map
+  }
+
+  function normalizePlanPendingFieldValue(field, value) {
+    const key = String(field ?? "")
+    if (key === "time") return normalizeClockTime(value)
+    if (key === "end_time" || key === "endTime") return normalizeClockTime(value)
+    if (key === "sort_order" || key === "sortOrder" || key === "order") {
+      const n = parseSortOrderValue(value)
+      return n == null ? "" : String(n)
+    }
+    if (key === "repeat_type" || key === "repeatType") return normalizeRepeatType(value)
+    if (key === "repeat_interval" || key === "repeatInterval") return String(normalizeRepeatInterval(value))
+    if (key === "repeat_days" || key === "repeatDays") return normalizeRepeatDays(value).join(",")
+    if (key === "repeat_until" || key === "repeatUntil") {
+      const parsed = parseDateKey(String(value ?? "").trim())
+      return parsed ? dateKeyFromDate(parsed) : ""
+    }
+    if (value == null) return ""
+    if (Array.isArray(value)) return JSON.stringify(value)
+    if (typeof value === "object") return JSON.stringify(value)
+    return String(value).trim()
+  }
+
+  function serverRowConfirmsPendingPlanRow(pendingRow, serverRow) {
+    if (!pendingRow || !serverRow) return false
+    const ignored = new Set(["user_id", "client_id", "updated_at", "created_at"])
+    for (const [field, value] of Object.entries(pendingRow ?? {})) {
+      if (ignored.has(field)) continue
+      if (field === "deleted_at") continue
+      const left = normalizePlanPendingFieldValue(field, value)
+      const right = normalizePlanPendingFieldValue(field, serverRow?.[field])
+      if (left !== right) return false
+    }
+    return true
+  }
+
+  function mergePendingPlanWrites(rows, options = {}) {
+    const shouldConfirmMatches = Boolean(options?.confirmMatches)
+    const baseRows = Array.isArray(rows) ? rows : []
+    const baseById = new Map(
+      baseRows
+        .map((row) => [String(row?.id ?? "").trim(), row])
+        .filter(([id]) => Boolean(id))
+    )
+    const pendingDeletes = { ...(pendingPlanDeletesRef.current ?? {}) }
+    const protectedDeleteIds = new Set()
+    let deletesChanged = false
+    const now = Date.now()
+
+    for (const [id, entry] of Object.entries(pendingDeletes)) {
+      const key = String(id ?? "").trim()
+      if (!key || !entry || Number(entry.expiresAt ?? 0) <= now) {
+        delete pendingDeletes[id]
+        deletesChanged = true
+        continue
+      }
+      if (shouldConfirmMatches && !baseById.has(key)) {
+        delete pendingDeletes[key]
+        deletesChanged = true
+        continue
+      }
+      protectedDeleteIds.add(key)
+    }
+    if (deletesChanged) pendingPlanDeletesRef.current = pendingDeletes
+
     const pending = { ...(pendingPlanWritesRef.current ?? {}) }
     const overlay = []
     let changed = false
-    const now = Date.now()
     for (const [id, entry] of Object.entries(pending)) {
-      if (!entry || Number(entry.expiresAt ?? 0) <= now) {
+      const key = String(id ?? "").trim()
+      if (!key || !entry || Number(entry.expiresAt ?? 0) <= now) {
         delete pending[id]
+        changed = true
+        continue
+      }
+      if (protectedDeleteIds.has(key)) continue
+      if (shouldConfirmMatches && serverRowConfirmsPendingPlanRow(entry.row, baseById.get(key))) {
+        delete pending[key]
         changed = true
         continue
       }
       if (entry.row) overlay.push(entry.row)
     }
     if (changed) pendingPlanWritesRef.current = pending
-    return mergeRowsById(rows, overlay)
+    const visibleBaseRows = baseRows.filter((row) => {
+      const id = String(row?.id ?? "").trim()
+      return !id || !protectedDeleteIds.has(id)
+    })
+    return mergeRowsById(visibleBaseRows, overlay)
   }
 
   function stagePlanRows(userId, rows) {
@@ -9413,16 +10000,109 @@ function AppInner() {
     if (list.length === 0) return
     const now = Date.now()
     const pending = { ...(pendingPlanWritesRef.current ?? {}) }
+    const pendingDeletes = { ...(pendingPlanDeletesRef.current ?? {}) }
     for (const row of list) {
       const id = String(row?.id ?? "").trim()
       pending[id] = { row, expiresAt: now + PENDING_REMOTE_WRITE_TTL_MS }
+      delete pendingDeletes[id]
     }
     pendingPlanWritesRef.current = pending
+    pendingPlanDeletesRef.current = pendingDeletes
+    plansRef.current = mergeRowsById(
+      (plansRef.current ?? []).filter((row) => !pendingDeletes[String(row?.id ?? "").trim()]),
+      list
+    )
     setPlans((prev) => {
-      const next = mergeRowsById(prev, list)
-      persistPlansCache(userId, next).catch(() => {})
+      const filteredPrev = (prev ?? []).filter((row) => !pendingDeletes[String(row?.id ?? "").trim()])
+      const next = mergeRowsById(filteredPrev, list)
+      schedulePlansCachePersist(userId, next)
       return next
     })
+  }
+
+  function stagePlanRowsSilently(rows) {
+    const list = Array.isArray(rows) ? rows.filter((row) => row && String(row?.id ?? "").trim()) : []
+    if (list.length === 0) return
+    const now = Date.now()
+    const pending = { ...(pendingPlanWritesRef.current ?? {}) }
+    const pendingDeletes = { ...(pendingPlanDeletesRef.current ?? {}) }
+    for (const row of list) {
+      const id = String(row?.id ?? "").trim()
+      pending[id] = { row, expiresAt: now + PENDING_REMOTE_WRITE_TTL_MS }
+      delete pendingDeletes[id]
+    }
+    pendingPlanWritesRef.current = pending
+    pendingPlanDeletesRef.current = pendingDeletes
+    plansRef.current = mergeRowsById(
+      (plansRef.current ?? []).filter((row) => !pendingDeletes[String(row?.id ?? "").trim()]),
+      list
+    )
+  }
+
+  function clearPendingPlanWrites(ids) {
+    const normalized = Array.isArray(ids) ? ids.map((id) => String(id ?? "").trim()).filter(Boolean) : []
+    if (normalized.length === 0) return
+    const pending = { ...(pendingPlanWritesRef.current ?? {}) }
+    let changed = false
+    for (const id of normalized) {
+      if (!Object.prototype.hasOwnProperty.call(pending, id)) continue
+      delete pending[id]
+      changed = true
+    }
+    if (changed) pendingPlanWritesRef.current = pending
+  }
+
+  function clearPendingPlanDeletes(ids) {
+    const normalized = Array.isArray(ids) ? ids.map((id) => String(id ?? "").trim()).filter(Boolean) : []
+    if (normalized.length === 0) return
+    const pending = { ...(pendingPlanDeletesRef.current ?? {}) }
+    let changed = false
+    for (const id of normalized) {
+      if (!Object.prototype.hasOwnProperty.call(pending, id)) continue
+      delete pending[id]
+      changed = true
+    }
+    if (changed) pendingPlanDeletesRef.current = pending
+  }
+
+  function stagePlanDeletes(userId, ids, deletedAt = new Date().toISOString()) {
+    const normalized = [...new Set((ids ?? []).map((id) => String(id ?? "").trim()).filter(Boolean))]
+    if (normalized.length === 0) return
+    const now = Date.now()
+    const idSet = new Set(normalized)
+    const pendingDeletes = { ...(pendingPlanDeletesRef.current ?? {}) }
+    const pendingWrites = { ...(pendingPlanWritesRef.current ?? {}) }
+    for (const id of normalized) {
+      pendingDeletes[id] = { deletedAt, expiresAt: now + PENDING_REMOTE_WRITE_TTL_MS }
+      delete pendingWrites[id]
+    }
+    pendingPlanDeletesRef.current = pendingDeletes
+    pendingPlanWritesRef.current = pendingWrites
+    plansRef.current = (plansRef.current ?? []).filter((row) => !idSet.has(String(row?.id ?? "").trim()))
+    setPlans((prev) => {
+      const next = (prev ?? []).filter((row) => !idSet.has(String(row?.id ?? "").trim()))
+      schedulePlansCachePersist(userId, next)
+      return next
+    })
+  }
+
+  function shouldIgnoreDuplicateTaskToggle(rowId, source = "default") {
+    const id = String(rowId ?? "").trim()
+    if (!id) return false
+    const key = `${String(source ?? "default")}:${id}`
+    const now = Date.now()
+    const lastAt = Number(taskToggleTouchGuardRef.current?.[key] ?? 0)
+    taskToggleTouchGuardRef.current = { ...(taskToggleTouchGuardRef.current ?? {}), [key]: now }
+    return Number.isFinite(lastAt) && lastAt > 0 && now - lastAt < 220
+  }
+
+  function flushPendingTaskToggleCommits() {
+    const entries = { ...(taskToggleCommitTimersRef.current ?? {}) }
+    taskToggleCommitTimersRef.current = {}
+    for (const entry of Object.values(entries)) {
+      if (entry?.timer) clearTimeout(entry.timer)
+      entry?.commit?.()
+    }
   }
 
   async function hydrateCachedPlannerState(userId) {
@@ -9432,10 +10112,18 @@ function AppInner() {
       readRightMemosCacheEntry(userId, memoYear)
     ])
     if (plansCache.rows.length > 0) {
-      setPlans((prev) => mergePendingPlanWrites(prev?.length ? prev : plansCache.rows))
+      setPlans((prev) => {
+        const protectedRows = mergePendingPlanWrites(prev?.length ? prev : plansCache.rows)
+        plansRef.current = protectedRows
+        return protectedRows
+      })
     }
     if (rightMemoCache.items && Object.keys(rightMemoCache.items).length > 0) {
-      setRightMemos((prev) => ({ ...(rightMemoCache.items ?? {}), ...(prev ?? {}) }))
+      setRightMemos((prev) => {
+        const next = { ...(rightMemoCache.items ?? {}), ...(prev ?? {}) }
+        rightMemosRef.current = next
+        return next
+      })
     }
   }
 
@@ -9912,12 +10600,16 @@ function AppInner() {
             setPlans((prev) => {
               const list = prev ?? []
               const index = list.findIndex((row) => String(row?.id ?? "").trim() === String(normalized.id))
+              let nextRows
               if (index >= 0) {
-                const next = [...list]
-                next[index] = { ...list[index], ...normalized }
-                return dedupeRowsById(next)
+                nextRows = [...list]
+                nextRows[index] = { ...list[index], ...normalized }
+              } else {
+                nextRows = [...list, normalized]
               }
-              return dedupeRowsById([...list, normalized])
+              const protectedRows = mergePendingPlanWrites(dedupeRowsById(nextRows))
+              plansRef.current = protectedRows
+              return protectedRows
             })
           }
           schedule("plans", () => loadPlans(userId, { silent: true }), 120)
@@ -9946,17 +10638,23 @@ function AppInner() {
             if (eventType === "DELETE") {
               setRightMemos((prev) => {
                 const current = prev ?? {}
-                if (!Object.prototype.hasOwnProperty.call(current, targetWindowId)) return current
                 const next = { ...current }
                 delete next[targetWindowId]
-                return next
+                const protectedNext = mergePendingRightMemoWrites(next)
+                rightMemosRef.current = protectedNext
+                persistRightMemosCache(userId, memoYear, protectedNext).catch(() => {})
+                return protectedNext
               })
             } else {
               const nextContent = String(payload?.new?.content ?? "")
               setRightMemos((prev) => {
                 const current = prev ?? {}
-                if (String(current[targetWindowId] ?? "") === nextContent) return current
-                return { ...current, [targetWindowId]: nextContent }
+                const next = { ...current, [targetWindowId]: nextContent }
+                const protectedNext = mergePendingRightMemoWrites(next)
+                if (String(current[targetWindowId] ?? "") === String(protectedNext[targetWindowId] ?? "")) return current
+                rightMemosRef.current = protectedNext
+                persistRightMemosCache(userId, memoYear, protectedNext).catch(() => {})
+                return protectedNext
               })
             }
           }
@@ -10160,6 +10858,10 @@ function AppInner() {
       const prevState = String(appStateRef.current ?? "")
       appStateRef.current = nextState
       const becameActive = prevState.match(/inactive|background/) && nextState === "active"
+      if (nextState !== "active") {
+        flushPendingTaskToggleCommits()
+        return
+      }
       if (!becameActive) return
       requestPlanNotificationSync(userId, plansRef.current, { force: true })
       loadPlans(userId, { silent: true }).catch(() => {})
@@ -10225,15 +10927,14 @@ function AppInner() {
         setAuthMessage(error.message || "Load failed.")
         const cached = await readPlansCacheEntry(userId)
         if (cached.rows.length > 0) {
-          setPlans(mergePendingPlanWrites(cached.rows))
+          const protectedRows = mergePendingPlanWrites(cached.rows)
+          plansRef.current = protectedRows
+          setPlans(protectedRows)
         }
       } else {
         let normalizedRows = dedupeRowsById(data ?? [])
-        const cached = await readPlansCacheEntry(userId)
-        if (isFreshLocalWrite(cached.savedAt) && cached.rows.length > 0) {
-          normalizedRows = mergeRowsById(normalizedRows, cached.rows)
-        }
-        const protectedRows = mergePendingPlanWrites(normalizedRows)
+        const protectedRows = mergePendingPlanWrites(normalizedRows, { confirmMatches: true })
+        plansRef.current = protectedRows
         setPlans(protectedRows)
         await persistPlansCache(userId, protectedRows)
         await backfillSortOrderFromLegacy(userId, protectedRows)
@@ -10518,37 +11219,10 @@ function AppInner() {
       if (!row?.window_id) continue
       map[row.window_id] = String(row?.content ?? "")
     }
-    const cached = await readRightMemosCacheEntry(userId, year)
-    if (isFreshLocalWrite(cached.savedAt)) {
-      for (const [id, value] of Object.entries(cached.items ?? {})) {
-        const key = String(id ?? "").trim()
-        if (!key) continue
-        map[key] = String(value ?? "")
-      }
-    }
-    const now = Date.now()
-    const pending = { ...(pendingRightMemoWritesRef.current ?? {}) }
-    let pendingChanged = false
-    for (const [id, entry] of Object.entries(pending)) {
-      const key = String(id ?? "").trim()
-      if (!key || !entry || typeof entry !== "object") {
-        delete pending[key]
-        pendingChanged = true
-        continue
-      }
-      const expiresAt = Number(entry.expiresAt ?? 0)
-      const value = String(entry.value ?? "")
-      const loadedValue = String(map[key] ?? "")
-      if (loadedValue === value || (expiresAt > 0 && now >= expiresAt)) {
-        delete pending[key]
-        pendingChanged = true
-        continue
-      }
-      map[key] = value
-    }
-    if (pendingChanged) pendingRightMemoWritesRef.current = pending
-    setRightMemos(map)
-    await persistRightMemosCache(userId, year, map)
+    const protectedMap = mergePendingRightMemoWrites(map, { confirmMatches: true })
+    rightMemosRef.current = protectedMap
+    setRightMemos(protectedMap)
+    await persistRightMemosCache(userId, year, protectedMap)
   }
 
   function stageRightMemoWrite(windowId, content) {
@@ -10561,6 +11235,7 @@ function AppInner() {
     }
     setRightMemos((prev) => {
       const next = { ...(prev ?? {}), [id]: text }
+      rightMemosRef.current = next
       persistRightMemosCache(session?.user?.id, memoYear, next).catch(() => {})
       return next
     })
@@ -10573,41 +11248,69 @@ function AppInner() {
     if (!id || id === "all") return
     const text = String(content ?? "")
     stageRightMemoWrite(id, text)
-    const basePayload = {
-      user_id: userId,
-      year: memoYear,
-      window_id: id,
-      content: text
-    }
-    let error = null
-    if (rightMemoMetaColumnsSupportedRef.current) {
-      const result = await supabase.from("right_memos").upsert(
-        {
-          ...basePayload,
-          updated_at: new Date().toISOString(),
-          client_id: clientId || null
-        },
-        { onConflict: "user_id,year,window_id" }
-      )
-      error = result?.error ?? null
-      if (error && isRightMemoMetaColumnError(error)) {
-        rightMemoMetaColumnsSupportedRef.current = false
-        error = null
-      } else if (!error) {
+    const nextSeq = (Number(rightMemoWriteSeqRef.current?.[id]) || 0) + 1
+    rightMemoWriteSeqRef.current = { ...(rightMemoWriteSeqRef.current ?? {}), [id]: nextSeq }
+
+    const runSave = async () => {
+      if (rightMemoWriteSeqRef.current?.[id] !== nextSeq) return
+      const basePayload = {
+        user_id: userId,
+        year: memoYear,
+        window_id: id,
+        content: text
+      }
+      let error = null
+      if (rightMemoMetaColumnsSupportedRef.current) {
+        const result = await supabase.from("right_memos").upsert(
+          {
+            ...basePayload,
+            updated_at: new Date().toISOString(),
+            client_id: clientId || null
+          },
+          { onConflict: "user_id,year,window_id" }
+        )
+        error = result?.error ?? null
+        if (error && isRightMemoMetaColumnError(error)) {
+          rightMemoMetaColumnsSupportedRef.current = false
+          error = null
+        } else if (!error) {
+          error = null
+        }
+      }
+      if (!error && !rightMemoMetaColumnsSupportedRef.current) {
+        const result = await supabase.from("right_memos").upsert(basePayload, {
+          onConflict: "user_id,year,window_id"
+        })
+        error = result?.error ?? null
+      }
+      if (error) {
+        if (rightMemoWriteSeqRef.current?.[id] === nextSeq) {
+          Alert.alert("오류", error.message || "메모 저장 실패")
+        }
         return
       }
+      if (rightMemoWriteSeqRef.current?.[id] === nextSeq) {
+        const pending = { ...(pendingRightMemoWritesRef.current ?? {}) }
+        if (String(pending?.[id]?.value ?? "") === text) {
+          delete pending[id]
+          pendingRightMemoWritesRef.current = pending
+        }
+        await persistRightMemosCache(userId, memoYear, { ...(rightMemosRef.current ?? {}), [id]: text })
+      }
     }
-    if (!error) {
-      const result = await supabase.from("right_memos").upsert(basePayload, {
-        onConflict: "user_id,year,window_id"
-      })
-      error = result?.error ?? null
+
+    const previousWrite = rightMemoWriteQueueRef.current?.[id] ?? Promise.resolve()
+    const writePromise = previousWrite.catch(() => {}).then(runSave)
+    rightMemoWriteQueueRef.current = { ...(rightMemoWriteQueueRef.current ?? {}), [id]: writePromise }
+    try {
+      await writePromise
+    } finally {
+      if (rightMemoWriteQueueRef.current?.[id] === writePromise) {
+        const nextQueue = { ...(rightMemoWriteQueueRef.current ?? {}) }
+        delete nextQueue[id]
+        rightMemoWriteQueueRef.current = nextQueue
+      }
     }
-    if (error) {
-      Alert.alert("오류", error.message || "메모 저장 실패")
-      return
-    }
-    await persistRightMemosCache(userId, memoYear, { ...(rightMemos ?? {}), [id]: text })
   }
 
   function getNextSortOrderForDate(dateKey, planRows) {
@@ -10696,13 +11399,14 @@ function AppInner() {
         : seriesIdOverride === null
           ? ""
           : String(repeatMeta.seriesId ?? "").trim()
+    const categoryId = String(next?.category_id ?? "__general__").trim() || "__general__"
 
     const payload = {
       user_id: userId,
       date: dateKey,
       time: normalizedTime || null,
-      content: String(next?.content ?? "").trim(),
-      category_id: String(next?.category_id ?? "__general__").trim() || "__general__",
+      content: stripRedundantInlineCategoryText(String(next?.content ?? "").trim(), categoryId),
+      category_id: categoryId,
       series_id: repeatType === "none" ? null : candidateSeries || null,
       repeat_type: repeatType,
       repeat_interval: repeatType === "none" ? 1 : repeatMeta.repeatInterval,
@@ -10954,32 +11658,47 @@ function isRightMemoMetaColumnError(error) {
     const insertedIds = []
     const userId = String(rows?.[0]?.user_id ?? session?.user?.id ?? "").trim()
     for (let i = 0; i < rows.length; i += chunkSize) {
-      let insertChunk = rows.slice(i, i + chunkSize)
-      let { data, error } = await supabase.from("plans").insert(insertChunk).select("*")
-      if (error && isRepeatColumnError(error)) {
-        markRepeatFallbackNotice()
-        insertChunk = insertChunk.map((row) => stripRepeatColumns(row))
-        const retry = await supabase.from("plans").insert(insertChunk).select("*")
-        data = retry.data
-        error = retry.error
+      let insertChunk = rows.slice(i, i + chunkSize).map((row) => ({
+        ...(row ?? {}),
+        id: String(row?.id ?? "").trim() || genPlanId()
+      }))
+      const stagedIds = insertChunk.map((row) => String(row?.id ?? "").trim()).filter(Boolean)
+      stagePlanRows(userId, insertChunk)
+      let data = null
+      let error = null
+      try {
+        const inserted = await supabase.from("plans").insert(insertChunk).select("*")
+        data = inserted.data
+        error = inserted.error
+        if (error && isRepeatColumnError(error)) {
+          markRepeatFallbackNotice()
+          insertChunk = insertChunk.map((row) => stripRepeatColumns(row))
+          const retry = await supabase.from("plans").insert(insertChunk).select("*")
+          data = retry.data
+          error = retry.error
+        }
+        if (error && isEndTimeColumnError(error)) {
+          markEndTimeFallbackNotice()
+          insertChunk = stripEndTimeFromRows(insertChunk)
+          const retry = await supabase.from("plans").insert(insertChunk).select("*")
+          data = retry.data
+          error = retry.error
+        }
+        if (error && isSortOrderColumnError(error)) {
+          markSortOrderFallbackNotice()
+          insertChunk = stripSortOrderFromRows(insertChunk)
+          const retry = await supabase.from("plans").insert(insertChunk).select("*")
+          data = retry.data
+          error = retry.error
+        }
+        if (error) throw error
+      } catch (errorToThrow) {
+        clearPendingPlanWrites(stagedIds)
+        loadPlans(userId, { silent: true }).catch(() => {})
+        throw errorToThrow
       }
-      if (error && isEndTimeColumnError(error)) {
-        markEndTimeFallbackNotice()
-        insertChunk = stripEndTimeFromRows(insertChunk)
-        const retry = await supabase.from("plans").insert(insertChunk).select("*")
-        data = retry.data
-        error = retry.error
-      }
-      if (error && isSortOrderColumnError(error)) {
-        markSortOrderFallbackNotice()
-        insertChunk = stripSortOrderFromRows(insertChunk)
-        const retry = await supabase.from("plans").insert(insertChunk).select("*")
-        data = retry.data
-        error = retry.error
-      }
-      if (error) throw error
       if ((data ?? []).length > 0) stagePlanRows(userId, data)
-      for (const row of data ?? []) {
+      for (const row of data ?? insertChunk) {
         const id = String(row?.id ?? "").trim()
         if (id) insertedIds.push(id)
       }
@@ -10987,25 +11706,43 @@ function isRightMemoMetaColumnError(error) {
     return insertedIds
   }
 
-  async function updatePlanRow(userId, id, payload) {
-    let { error } = await supabase.from("plans").update(payload).eq("id", id).eq("user_id", userId)
-    if (error && isRepeatColumnError(error)) {
-      markRepeatFallbackNotice()
-      const retry = await supabase.from("plans").update(stripRepeatColumns(payload)).eq("id", id).eq("user_id", userId)
-      error = retry.error
+  async function updatePlanRow(userId, id, payload, options = {}) {
+    const shouldStage = options?.stage !== false
+    if (shouldStage) {
+      stagePlanRows(userId, [{ id, user_id: userId, ...(payload ?? {}) }])
     }
-    if (error && isEndTimeColumnError(error)) {
-      markEndTimeFallbackNotice()
-      const retry = await supabase.from("plans").update(stripEndTimeColumns(payload)).eq("id", id).eq("user_id", userId)
-      error = retry.error
+    const runUpdate = async () => {
+      let { error } = await supabase.from("plans").update(payload).eq("id", id).eq("user_id", userId)
+      if (error && isRepeatColumnError(error)) {
+        markRepeatFallbackNotice()
+        const retry = await supabase.from("plans").update(stripRepeatColumns(payload)).eq("id", id).eq("user_id", userId)
+        error = retry.error
+      }
+      if (error && isEndTimeColumnError(error)) {
+        markEndTimeFallbackNotice()
+        const retry = await supabase.from("plans").update(stripEndTimeColumns(payload)).eq("id", id).eq("user_id", userId)
+        error = retry.error
+      }
+      if (error && isSortOrderColumnError(error)) {
+        markSortOrderFallbackNotice()
+        const retry = await supabase.from("plans").update(stripSortOrderColumns(payload)).eq("id", id).eq("user_id", userId)
+        error = retry.error
+      }
+      if (error) throw error
     }
-    if (error && isSortOrderColumnError(error)) {
-      markSortOrderFallbackNotice()
-      const retry = await supabase.from("plans").update(stripSortOrderColumns(payload)).eq("id", id).eq("user_id", userId)
-      error = retry.error
+    const rowId = String(id ?? "").trim()
+    const previousWrite = planWriteQueueRef.current?.[rowId] ?? Promise.resolve()
+    const writePromise = previousWrite.catch(() => {}).then(runUpdate)
+    planWriteQueueRef.current = { ...(planWriteQueueRef.current ?? {}), [rowId]: writePromise }
+    try {
+      await writePromise
+    } finally {
+      if (planWriteQueueRef.current?.[rowId] === writePromise) {
+        const nextQueue = { ...(planWriteQueueRef.current ?? {}) }
+        delete nextQueue[rowId]
+        planWriteQueueRef.current = nextQueue
+      }
     }
-    if (error) throw error
-    stagePlanRows(userId, [{ id, user_id: userId, ...(payload ?? {}) }])
   }
 
   async function updateRecurringSeriesRows(userId, next, { futureOnly = false } = {}) {
@@ -11074,29 +11811,35 @@ function isRightMemoMetaColumnError(error) {
     })).filter((row) => row.id)
 
     if (payloads.length === 0) return
-    if (sortOrderSupportedRef.current) {
-      const { error } = await supabase.from("plans").upsert(payloads, { onConflict: "id" })
-      if (error) {
-        if (isSortOrderColumnError(error)) {
-          markSortOrderFallbackNotice()
+    stagePlanRows(userId, payloads)
+
+    const runOrderUpdate = async () => {
+      if (sortOrderSupportedRef.current) {
+        const { error } = await supabase.from("plans").upsert(payloads, { onConflict: "id" })
+        if (error) {
+          if (isSortOrderColumnError(error)) {
+            markSortOrderFallbackNotice()
+          } else {
+            throw error
+          }
         } else {
-          throw error
+          return
         }
-      } else {
-        stagePlanRows(userId, payloads)
-        return
       }
+
+      const fallbackPayloads = payloads.map(({ id, user_id, updated_at, client_id }) => ({
+        id,
+        user_id,
+        updated_at,
+        client_id
+      }))
+      const { error: fallbackError } = await supabase.from("plans").upsert(fallbackPayloads, { onConflict: "id" })
+      if (fallbackError) throw fallbackError
     }
 
-    const fallbackPayloads = payloads.map(({ id, user_id, updated_at, client_id }) => ({
-      id,
-      user_id,
-      updated_at,
-      client_id
-    }))
-    const { error: fallbackError } = await supabase.from("plans").upsert(fallbackPayloads, { onConflict: "id" })
-    if (fallbackError) throw fallbackError
-    stagePlanRows(userId, payloads)
+    const writePromise = planOrderWriteQueueRef.current.catch(() => {}).then(runOrderUpdate)
+    planOrderWriteQueueRef.current = writePromise
+    await writePromise
   }
 
   function applyLegacySeriesMatch(query, target, { futureOnly = false } = {}) {
@@ -11269,6 +12012,26 @@ function isRightMemoMetaColumnError(error) {
         const softDeleteOldRows = async () => {
           if (deletedBeforeInsert) return
           const deletedAt = new Date().toISOString()
+          const localRegenerateDeleteIds = new Set(
+            (plansRef.current ?? [])
+              .filter((row) => {
+                const rowId = String(row?.id ?? "").trim()
+                if (!rowId) return false
+                const rowSeriesId = String(row?.series_id ?? row?.seriesId ?? "").trim()
+                const rowDate = String(row?.date ?? "").trim()
+                if (sourceSeriesId && editScope === "all") return rowSeriesId === sourceSeriesId
+                if (sourceSeriesId && editScope === "future") {
+                  const futureFrom = String(effectiveNext?.original_date ?? dateKey).trim() || dateKey
+                  return rowSeriesId === sourceSeriesId && (!futureFrom || rowDate >= futureFrom)
+                }
+                if (legacyDeleteIds.length > 0) return legacyDeleteIds.includes(rowId)
+                return rowId === String(effectiveNext.id)
+              })
+              .map((row) => String(row?.id ?? "").trim())
+          )
+          if (localRegenerateDeleteIds.size > 0) {
+            stagePlanDeletes(userId, [...localRegenerateDeleteIds], deletedAt)
+          }
           if (sourceSeriesId && repeatColumnsSupportedRef.current) {
             let query = supabase
               .from("plans")
@@ -11303,6 +12066,7 @@ function isRightMemoMetaColumnError(error) {
             }
             await softDeletePlansByIds(userId, legacyDeleteIds, deletedAt)
           }
+          clearPendingPlanDeletes([...localRegenerateDeleteIds])
           deletedBeforeInsert = true
         }
 
@@ -11347,6 +12111,7 @@ function isRightMemoMetaColumnError(error) {
     } catch (error) {
       const message = error?.message || "Save failed."
       setAuthMessage(message)
+      loadPlans(userId, { silent: true }).catch(() => {})
       Alert.alert("저장 실패", message)
       return false
     }
@@ -11536,7 +12301,7 @@ function isRightMemoMetaColumnError(error) {
     const nextTarget = typeof target === "string" ? { id: target, delete_scope: "single" } : target
     if (!supabase || !userId || !nextTarget?.id) return false
 
-    setLoading(true)
+    let stagedDeleteIds = []
     try {
       const deletedAt = new Date().toISOString()
       const scope = String(nextTarget?.delete_scope ?? "single")
@@ -11559,6 +12324,9 @@ function isRightMemoMetaColumnError(error) {
           })
           .map((row) => String(row?.id ?? "").trim())
       )
+      localDeleteIds.add(String(nextTarget.id))
+      stagedDeleteIds = [...localDeleteIds]
+      stagePlanDeletes(userId, stagedDeleteIds, deletedAt)
 
       let query = supabase
         .from("plans")
@@ -11597,23 +12365,14 @@ function isRightMemoMetaColumnError(error) {
         throw error
       }
 
-      if (localDeleteIds.size > 0) {
-        const pending = { ...(pendingPlanWritesRef.current ?? {}) }
-        for (const id of localDeleteIds) delete pending[id]
-        pendingPlanWritesRef.current = pending
-        setPlans((prev) => {
-          const next = (prev ?? []).filter((row) => !localDeleteIds.has(String(row?.id ?? "").trim()))
-          persistPlansCache(userId, next).catch(() => {})
-          return next
-        })
-      }
+      clearPendingPlanDeletes(stagedDeleteIds)
       loadPlans(userId, { silent: true }).catch(() => {})
       return true
     } catch (error) {
+      clearPendingPlanDeletes(stagedDeleteIds)
+      loadPlans(userId, { silent: true }).catch(() => {})
       setAuthMessage(error?.message || "Delete failed.")
       return false
-    } finally {
-      setLoading(false)
     }
   }
 
@@ -11870,6 +12629,7 @@ function isRightMemoMetaColumnError(error) {
       .map((id) => String(id))
     const hasSeries = Boolean(String(explicitRepeatMeta.seriesId ?? "").trim()) || explicitRepeatMeta.repeatType !== "none"
     const hasRecurrenceHint = hasSeries || Boolean(inferredRepeatMeta?.hasHint)
+    const displayContent = getPlanDisplayText(item) || baseContent
     setPlanDraft({
       id: item.id,
       date: baseDate,
@@ -11880,7 +12640,7 @@ function isRightMemoMetaColumnError(error) {
       alarm_lead_minutes: effectiveAlarmLeadMinutes,
       original_time: baseTime,
       original_end_time: baseEndTime || null,
-      content: baseContent,
+      content: displayContent,
       original_content: baseContent,
       category_id: baseCategory,
       original_category_id: baseCategory,
@@ -11910,36 +12670,102 @@ function isRightMemoMetaColumnError(error) {
     }, 80)
   }
 
-  async function toggleTaskCompletion(item) {
+  async function toggleTaskCompletion(item, options = {}) {
     const row = item?.row ?? item
     const userId = session?.user?.id
     const rowId = String(row?.id ?? "").trim()
     if (!userId || !rowId) return
+    if (shouldIgnoreDuplicateTaskToggle(rowId, options?.source ?? "default")) return
 
-    const parsed = parsePlanMetaSuffixes(row?.content)
+    const currentRow = (plansRef.current ?? []).find((candidate) => String(candidate?.id ?? "").trim() === rowId) ?? row
+    const parsed = parsePlanMetaSuffixes(currentRow?.content)
     if (!parsed.baseRaw) return
 
-    const nextCompleted = parsed.completed == null ? true : !Boolean(parsed.completed)
-    const nextContent = buildPlanContentWithMeta(parsed.baseRaw, "task", nextCompleted)
-    const updatedAt = new Date().toISOString()
-
-    setPlans((prev) =>
-      (prev ?? []).map((current) =>
-        String(current?.id ?? "").trim() === rowId
-          ? { ...current, content: nextContent, updated_at: updatedAt, client_id: clientId || current?.client_id || null }
-          : current
-      )
+    const currentCompleted = getEffectiveTaskCompleted(currentRow, parsed.completed, taskCompletionOverrides)
+    const nextCompleted = !currentCompleted
+    const normalizedBaseRaw = stripRedundantInlineCategoryText(
+      parsed.baseRaw,
+      currentRow?.category_id ?? row?.category_id
     )
+    const nextContent = buildPlanContentWithMeta(normalizedBaseRaw || parsed.baseRaw, "task", nextCompleted)
+    const updatedAt = new Date().toISOString()
+    const nextRow = {
+      ...(currentRow ?? row),
+      id: rowId,
+      content: nextContent,
+      updated_at: updatedAt,
+      client_id: clientId || currentRow?.client_id || row?.client_id || null
+    }
+    const nextSeq = (Number(taskToggleSeqRef.current?.[rowId]) || 0) + 1
+    taskToggleSeqRef.current = { ...(taskToggleSeqRef.current ?? {}), [rowId]: nextSeq }
+    setTaskCompletionOverrides((prev) => ({ ...(prev ?? {}), [rowId]: nextCompleted }))
+    stagePlanRowsSilently([nextRow])
 
-    try {
-      await updatePlanRow(userId, rowId, {
-        content: nextContent,
-        updated_at: updatedAt,
-        client_id: clientId || null
-      })
-    } catch (error) {
-      Alert.alert("Task 저장 실패", error?.message || "상태 변경에 실패했습니다.")
-      await loadPlans(userId)
+    const existingCommit = taskToggleCommitTimersRef.current?.[rowId]
+    if (existingCommit?.timer) clearTimeout(existingCommit.timer)
+
+    const payload = {
+      content: nextContent,
+      updated_at: updatedAt,
+      client_id: clientId || null
+    }
+
+    let commitStarted = false
+    const commit = () => {
+      if (commitStarted) return
+      commitStarted = true
+      const timers = { ...(taskToggleCommitTimersRef.current ?? {}) }
+      if (timers[rowId]?.commit === commit) {
+        delete timers[rowId]
+        taskToggleCommitTimersRef.current = timers
+      }
+      if (taskToggleSeqRef.current?.[rowId] !== nextSeq) return
+
+      stagePlanRows(userId, [nextRow])
+      const previousWrite = taskToggleWriteQueueRef.current?.[rowId] ?? Promise.resolve()
+      const writePromise = previousWrite
+        .catch(() => {})
+        .then(() => updatePlanRow(userId, rowId, payload, { stage: false }))
+      taskToggleWriteQueueRef.current = { ...(taskToggleWriteQueueRef.current ?? {}), [rowId]: writePromise }
+
+      writePromise
+        .then(() => {
+          if (taskToggleSeqRef.current?.[rowId] === nextSeq) {
+            const nextSeqMap = { ...(taskToggleSeqRef.current ?? {}) }
+            delete nextSeqMap[rowId]
+            taskToggleSeqRef.current = nextSeqMap
+            setTaskCompletionOverrides((prev) => {
+              if (!prev || !Object.prototype.hasOwnProperty.call(prev, rowId)) return prev
+              const next = { ...prev }
+              delete next[rowId]
+              return next
+            })
+          }
+        })
+        .catch((error) => {
+          if (taskToggleSeqRef.current?.[rowId] !== nextSeq) return
+          clearPendingPlanWrites([rowId])
+          setTaskCompletionOverrides((prev) => {
+            if (!prev || !Object.prototype.hasOwnProperty.call(prev, rowId)) return prev
+            const next = { ...prev }
+            delete next[rowId]
+            return next
+          })
+          Alert.alert("Task 저장 실패", error?.message || "상태 변경에 실패했습니다.")
+          loadPlans(userId).catch(() => {})
+        })
+        .finally(() => {
+          if (taskToggleWriteQueueRef.current?.[rowId] === writePromise) {
+            const nextQueue = { ...(taskToggleWriteQueueRef.current ?? {}) }
+            delete nextQueue[rowId]
+            taskToggleWriteQueueRef.current = nextQueue
+          }
+        })
+    }
+    const commitTimer = setTimeout(commit, TASK_TOGGLE_COMMIT_DELAY_MS)
+    taskToggleCommitTimersRef.current = {
+      ...(taskToggleCommitTimersRef.current ?? {}),
+      [rowId]: { timer: commitTimer, commit }
     }
   }
 
@@ -11969,68 +12795,103 @@ function isRightMemoMetaColumnError(error) {
     setTasksVisible(false)
   }
 
-  const filteredPlans = useMemo(() => {
-    if (!activeTitle) return plans
-    return (plans ?? []).filter((row) => String(row?.category_id ?? "").trim() === activeTitle)
-  }, [plans, activeTitle])
+  const planCollections = useMemo(() => {
+    const allRows = []
+    const rowsByCategory = new Map()
+    const allDateBuckets = new Map()
+    const dateBucketsByCategory = new Map()
+    const allTaskItems = []
+    const taskItemsByCategory = new Map()
+
+    const addToMap = (map, key, value) => {
+      const normalizedKey = String(key ?? "").trim()
+      if (!normalizedKey) return
+      if (!map.has(normalizedKey)) map.set(normalizedKey, [])
+      map.get(normalizedKey).push(value)
+    }
+
+    for (const row of plans ?? []) {
+      if (!isVisibleSchedulePlanRow(row)) continue
+      const dateKey = String(row?.date ?? "no-date").trim()
+      const category = String(row?.category_id ?? "").trim()
+      allRows.push(row)
+      addToMap(allDateBuckets, dateKey, row)
+      if (category) {
+        addToMap(rowsByCategory, category, row)
+        if (!dateBucketsByCategory.has(category)) dateBucketsByCategory.set(category, new Map())
+        addToMap(dateBucketsByCategory.get(category), dateKey, row)
+      }
+
+      const taskItem = buildTaskItemFromPlanRow(row)
+      if (taskItem) {
+        allTaskItems.push(taskItem)
+        if (category) addToMap(taskItemsByCategory, category, taskItem)
+      }
+    }
+
+    const sortDateBuckets = (buckets) => {
+      const sorted = new Map()
+      for (const [key, rows] of buckets.entries()) {
+        sorted.set(key, sortItemsByTimeAndOrder(rows))
+      }
+      return sorted
+    }
+
+    const allItemsByDateMap = sortDateBuckets(allDateBuckets)
+    const itemsByDateByCategory = new Map()
+    const sectionsByCategory = new Map()
+    for (const [category, buckets] of dateBucketsByCategory.entries()) {
+      const sortedMap = sortDateBuckets(buckets)
+      itemsByDateByCategory.set(category, sortedMap)
+      sectionsByCategory.set(category, buildDateSectionsFromMap(sortedMap))
+    }
+
+    const sortedTaskItemsByCategory = new Map()
+    for (const [category, items] of taskItemsByCategory.entries()) {
+      sortedTaskItemsByCategory.set(category, sortTaskItems(items))
+    }
+
+    return {
+      allRows,
+      rowsByCategory,
+      allItemsByDate: allItemsByDateMap,
+      allSections: buildDateSectionsFromMap(allItemsByDateMap),
+      itemsByDateByCategory,
+      sectionsByCategory,
+      allTaskItems: sortTaskItems(allTaskItems),
+      taskItemsByCategory: sortedTaskItemsByCategory
+    }
+  }, [plans])
 
   const todayForTasks = new Date()
   const taskTodayKey = dateToKey(todayForTasks.getFullYear(), todayForTasks.getMonth() + 1, todayForTasks.getDate())
 
-  const taskItems = useMemo(() => extractTaskItemsFromPlanRows(filteredPlans), [filteredPlans])
+  const taskItems = useMemo(() => {
+    if (!activeTitle) return planCollections.allTaskItems
+    return planCollections.taskItemsByCategory.get(activeTitle) ?? []
+  }, [activeTitle, planCollections])
 
   const taskCount = useMemo(() => {
     const ids = new Set()
     for (const item of taskItems ?? []) {
-      if (item?.completed) continue
+      if (getEffectiveTaskCompleted(item, item?.completed, taskCompletionOverrides)) continue
       const key = String(item?.planId ?? item?.id ?? "").trim()
       if (key) ids.add(key)
     }
     return ids.size
-  }, [taskItems])
+  }, [taskItems, taskCompletionOverrides])
 
   const sections = useMemo(() => {
-    const map = new Map()
-    for (const row of filteredPlans ?? []) {
-      if (!isVisibleSchedulePlanRow(row)) continue
-      const key = String(row?.date ?? "no-date")
-      if (!map.has(key)) map.set(key, [])
-      map.get(key).push(row)
-    }
-    const keys = [...map.keys()].sort()
-    return keys.map((key) => ({
-      title: key,
-      data: sortItemsByTimeAndOrder(map.get(key) ?? [])
-    }))
-  }, [filteredPlans])
+    if (!activeTitle) return planCollections.allSections
+    return planCollections.sectionsByCategory.get(activeTitle) ?? []
+  }, [activeTitle, planCollections])
 
   const itemsByDate = useMemo(() => {
-    const map = new Map()
-    for (const row of filteredPlans ?? []) {
-      if (!isVisibleSchedulePlanRow(row)) continue
-      const key = String(row?.date ?? "no-date")
-      if (!map.has(key)) map.set(key, [])
-      map.get(key).push(row)
-    }
-    for (const [key, items] of map.entries()) {
-      map.set(key, sortItemsByTimeAndOrder(items))
-    }
-    return map
-  }, [filteredPlans])
+    if (!activeTitle) return planCollections.allItemsByDate
+    return planCollections.itemsByDateByCategory.get(activeTitle) ?? new Map()
+  }, [activeTitle, planCollections])
 
-  const allItemsByDate = useMemo(() => {
-    const map = new Map()
-    for (const row of plans ?? []) {
-      if (!isVisibleSchedulePlanRow(row)) continue
-      const key = String(row?.date ?? "no-date")
-      if (!map.has(key)) map.set(key, [])
-      map.get(key).push(row)
-    }
-    for (const [key, items] of map.entries()) {
-      map.set(key, sortItemsByTimeAndOrder(items))
-    }
-    return map
-  }, [plans])
+  const allItemsByDate = planCollections.allItemsByDate
 
   const memoText = useMemo(() => {
     if (activeTabId !== "all") return rightMemos[activeTabId] ?? ""
@@ -12271,6 +13132,7 @@ function isRightMemoMetaColumnError(error) {
         visible={tasksVisible}
         tone={tone}
         tasks={taskItems}
+        taskCompletionOverrides={taskCompletionOverrides}
         onToggleTask={toggleTaskCompletion}
         onOpenTask={openTaskItem}
         onDeleteTask={deleteCompletedTaskItem}
@@ -12325,6 +13187,7 @@ function isRightMemoMetaColumnError(error) {
         </Pressable>
       ) : null}
       <Tab.Navigator
+        detachInactiveScreens={false}
         screenListeners={{
           state: (e) => {
             const route = e?.data?.state?.routes?.[e.data.state.index]
@@ -12333,6 +13196,9 @@ function isRightMemoMetaColumnError(error) {
         }}
         screenOptions={({ route }) => ({
           headerShown: false,
+          lazy: true,
+          freezeOnBlur: false,
+          animation: "none",
           tabBarStyle,
           sceneStyle: { paddingBottom: sceneBottomInset },
           tabBarLabelStyle: bottomTabLabelStyle,
@@ -12381,6 +13247,7 @@ function isRightMemoMetaColumnError(error) {
               }}
               onTasks={() => setTasksVisible(true)}
               tasksCount={taskCount}
+              taskCompletionOverrides={taskCompletionOverrides}
               onToggleTask={toggleTaskCompletion}
               onRefresh={() => {
                 loadPlans(session?.user?.id)
@@ -12453,6 +13320,7 @@ function isRightMemoMetaColumnError(error) {
               }}
               onTasks={() => setTasksVisible(true)}
               tasksCount={taskCount}
+              taskCompletionOverrides={taskCompletionOverrides}
               onToggleTask={toggleTaskCompletion}
               onRefresh={() => {
                 loadPlans(session?.user?.id)
@@ -15114,6 +15982,7 @@ const styles = StyleSheet.create({
     paddingBottom: 6,
     alignItems: "flex-start",
     justifyContent: "flex-start",
+    position: "relative",
     overflow: "visible"
   },
   calendarCellDark: {
@@ -15174,6 +16043,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "flex-start",
     paddingRight: 2,
+    position: "relative",
+    zIndex: 2,
     overflow: "hidden"
   },
   calendarDay: {
@@ -15231,7 +16102,8 @@ const styles = StyleSheet.create({
     marginTop: 4,
     paddingHorizontal: 2,
     overflow: "hidden",
-    position: "relative"
+    position: "relative",
+    zIndex: 2
   },
   calendarDropIndicator: {
     position: "absolute",
@@ -15280,6 +16152,7 @@ const styles = StyleSheet.create({
     borderRadius: 3,
     alignItems: "flex-start",
     justifyContent: "center",
+    position: "relative",
     overflow: "hidden"
   },
   calendarLabelRange: {
@@ -15298,6 +16171,8 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 3,
+    position: "relative",
+    zIndex: 2,
     overflow: "hidden"
   },
   calendarLabelBody: {
@@ -15724,6 +16599,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
+    minHeight: 58,
     paddingVertical: 12,
     paddingHorizontal: 12,
     borderBottomWidth: 1,
@@ -15741,18 +16617,23 @@ const styles = StyleSheet.create({
   dayModalItemTime: {
     width: 62,
     fontSize: 12,
+    lineHeight: 17,
     fontWeight: "900",
-    color: "#334155"
+    color: "#334155",
+    textAlignVertical: "center"
   },
   dayModalItemTimeEmpty: {
     width: 62,
     fontSize: 12,
+    lineHeight: 17,
     fontWeight: "900",
-    color: "#94a3b8"
+    color: "#94a3b8",
+    textAlignVertical: "center"
   },
   dayModalItemMain: {
     flex: 1,
     minWidth: 0,
+    minHeight: 28,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
@@ -15769,7 +16650,10 @@ const styles = StyleSheet.create({
     flex: 1,
     minWidth: 0,
     fontSize: 13,
-    color: "#0f172a"
+    lineHeight: 19,
+    color: "#0f172a",
+    includeFontPadding: false,
+    textAlignVertical: "center"
   },
   dayModalDividerRow: {
     paddingHorizontal: 0
@@ -15940,14 +16824,14 @@ const styles = StyleSheet.create({
   },
   reorderDragGhost: {
     backgroundColor: "#ffffff",
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#e2e8f0",
+    borderRadius: 0,
+    borderWidth: 0,
+    borderColor: "transparent",
     shadowColor: "#0f172a",
-    shadowOpacity: 0.18,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 8 },
-    elevation: 6
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2
   },
   reorderDragGhostDark: {
     backgroundColor: DARK_SURFACE_2,
@@ -16603,6 +17487,33 @@ const styles = StyleSheet.create({
     marginTop: 8,
     gap: 8
   },
+  editorRepeatTypeRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6
+  },
+  editorRepeatTypePill: {
+    flex: 0.9,
+    minWidth: 0,
+    height: 34,
+    paddingHorizontal: 5,
+    borderRadius: 10,
+    backgroundColor: "#f1f5f9",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  editorRepeatTypePillWide: {
+    flex: 1.5
+  },
+  editorRepeatTypeText: {
+    fontSize: 13,
+    lineHeight: 17,
+    fontWeight: "800",
+    color: "#334155",
+    textAlign: "center"
+  },
   editorAnniversaryWrap: {
     gap: 8
   },
@@ -17009,21 +17920,29 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     flexDirection: "row",
     alignItems: "center",
-    flexWrap: "wrap",
-    gap: 8
+    flexWrap: "nowrap",
+    gap: 6
   },
   editorAlarmLeadRowDisabled: {
     opacity: 0.58
   },
   editorAlarmLeadPill: {
+    flex: 1,
+    minWidth: 0,
     height: 30,
-    paddingHorizontal: 11,
+    paddingHorizontal: 4,
     borderRadius: 999,
     borderWidth: 1,
     borderColor: "#d6dbe6",
     backgroundColor: "#f8fafc",
     alignItems: "center",
     justifyContent: "center"
+  },
+  editorAlarmLeadPillNone: {
+    flex: 1.18
+  },
+  editorAlarmLeadPillShort: {
+    flex: 0.72
   },
   editorAlarmLeadPillDark: {
     backgroundColor: "rgba(255, 255, 255, 0.06)",
@@ -17039,8 +17958,10 @@ const styles = StyleSheet.create({
   },
   editorAlarmLeadText: {
     fontSize: 11,
+    lineHeight: 14,
     fontWeight: "900",
-    color: "#475569"
+    color: "#475569",
+    textAlign: "center"
   },
   editorAlarmLeadTextActive: {
     color: ACCENT_BLUE
