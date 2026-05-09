@@ -21,7 +21,7 @@
         "backgroundColor": "#2b67c7"
       },
       "edgeToEdgeEnabled": true,
-      "versionCode": 4,
+      "versionCode": 5,
       "package": "com.anonymous.plannermobile"
     },
     "web": {

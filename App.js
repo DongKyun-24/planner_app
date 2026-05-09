@@ -148,7 +148,11 @@ const PLAN_ALARM_LEAD_PREFS_KEY = "plannerMobile.planAlarmLeadPrefs.v1"
 const PLAN_NOTIFICATION_SCHEDULE_IDS_KEY = "plannerMobile.planNotificationScheduleIds.v1"
 const PLAN_CACHE_KEY_PREFIX = "plannerMobile.planCache.v1"
 const RIGHT_MEMO_CACHE_KEY_PREFIX = "plannerMobile.rightMemoCache.v1"
+const PENDING_REMOTE_QUEUE_KEY_PREFIX = "plannerMobile.pendingRemoteQueue.v1"
 const PENDING_REMOTE_WRITE_TTL_MS = 10 * 60 * 1000
+const DURABLE_REMOTE_WRITE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const DURABLE_REMOTE_QUEUE_PERSIST_DELAY_MS = 180
+const DURABLE_REMOTE_QUEUE_RETRY_MS = 4500
 const TASK_TOGGLE_COMMIT_DELAY_MS = 1000
 const PLAN_NOTIFICATION_CHANNEL_ID = "planner-reminders"
 const PLAN_NOTIFICATION_MAX_COUNT = Platform.OS === "android" ? 240 : 60
@@ -9710,6 +9714,13 @@ function AppInner() {
   const pendingPlanWritesRef = useRef({})
   const pendingPlanDeletesRef = useRef({})
   const pendingRightMemoWritesRef = useRef({})
+  const durablePlanWritesRef = useRef({})
+  const durablePlanDeletesRef = useRef({})
+  const durableRightMemoWritesRef = useRef({})
+  const durableQueueLoadedUserRef = useRef("")
+  const durableQueuePersistTimerRef = useRef(null)
+  const durableQueueFlushTimerRef = useRef(null)
+  const durableQueueFlushingRef = useRef(false)
   const planWriteQueueRef = useRef({})
   const planOrderWriteQueueRef = useRef(Promise.resolve())
   const rightMemoWriteQueueRef = useRef({})
@@ -9727,6 +9738,8 @@ function AppInner() {
   useEffect(() => {
     return () => {
       if (plansCachePersistTimerRef.current) clearTimeout(plansCachePersistTimerRef.current)
+      if (durableQueuePersistTimerRef.current) clearTimeout(durableQueuePersistTimerRef.current)
+      if (durableQueueFlushTimerRef.current) clearTimeout(durableQueueFlushTimerRef.current)
       for (const entry of Object.values(taskToggleCommitTimersRef.current ?? {})) {
         if (entry?.timer) clearTimeout(entry.timer)
         entry?.commit?.()
@@ -9806,6 +9819,10 @@ function AppInner() {
     return `${RIGHT_MEMO_CACHE_KEY_PREFIX}.${userId}.${year}`
   }
 
+  function pendingRemoteQueueStorageKey(userId) {
+    return `${PENDING_REMOTE_QUEUE_KEY_PREFIX}.${userId}`
+  }
+
   function isFreshLocalWrite(savedAt) {
     const at = Number(savedAt ?? 0)
     return Number.isFinite(at) && at > 0 && Date.now() - at <= PENDING_REMOTE_WRITE_TTL_MS
@@ -9876,6 +9893,412 @@ function AppInner() {
       )
     } catch (_e) {
       // ignore cache errors
+    }
+  }
+
+  function normalizeDurableRemoteQueue(value) {
+    const source = value && typeof value === "object" && !Array.isArray(value) ? value : {}
+    const normalizeObject = (raw) => (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {})
+    return {
+      planWrites: normalizeObject(source.planWrites),
+      planDeletes: normalizeObject(source.planDeletes),
+      rightMemoWrites: normalizeObject(source.rightMemoWrites)
+    }
+  }
+
+  function getDurableRemoteQueueSnapshot() {
+    return {
+      savedAt: Date.now(),
+      planWrites: durablePlanWritesRef.current ?? {},
+      planDeletes: durablePlanDeletesRef.current ?? {},
+      rightMemoWrites: durableRightMemoWritesRef.current ?? {}
+    }
+  }
+
+  function getDurableRemoteQueueCount() {
+    return (
+      Object.keys(durablePlanWritesRef.current ?? {}).length +
+      Object.keys(durablePlanDeletesRef.current ?? {}).length +
+      Object.keys(durableRightMemoWritesRef.current ?? {}).length
+    )
+  }
+
+  async function persistDurableRemoteQueue(userId) {
+    const normalizedUserId = String(userId ?? "").trim()
+    if (!normalizedUserId) return
+    try {
+      await AsyncStorage.setItem(
+        pendingRemoteQueueStorageKey(normalizedUserId),
+        JSON.stringify(getDurableRemoteQueueSnapshot())
+      )
+    } catch (_e) {
+      // keep the in-memory queue even if local persistence fails
+    }
+  }
+
+  function scheduleDurableRemoteQueuePersist(userId, delay = DURABLE_REMOTE_QUEUE_PERSIST_DELAY_MS) {
+    const normalizedUserId = String(userId ?? "").trim()
+    if (!normalizedUserId) return
+    if (durableQueuePersistTimerRef.current) clearTimeout(durableQueuePersistTimerRef.current)
+    durableQueuePersistTimerRef.current = setTimeout(() => {
+      durableQueuePersistTimerRef.current = null
+      persistDurableRemoteQueue(normalizedUserId).catch(() => {})
+    }, Math.max(0, Number(delay) || 0))
+  }
+
+  function applyDurableRemoteQueueOverlay(userId) {
+    const normalizedUserId = String(userId ?? "").trim()
+    if (!normalizedUserId) return
+    const now = Date.now()
+    const planWrites = durablePlanWritesRef.current ?? {}
+    const planDeletes = durablePlanDeletesRef.current ?? {}
+    const rightMemoWrites = durableRightMemoWritesRef.current ?? {}
+
+    const nextPendingWrites = { ...(pendingPlanWritesRef.current ?? {}) }
+    const nextPendingDeletes = { ...(pendingPlanDeletesRef.current ?? {}) }
+    for (const [id, entry] of Object.entries(planWrites)) {
+      const key = String(id ?? "").trim()
+      if (!key || !entry?.row) continue
+      nextPendingWrites[key] = { row: entry.row, expiresAt: now + DURABLE_REMOTE_WRITE_TTL_MS }
+      delete nextPendingDeletes[key]
+    }
+    for (const [id, entry] of Object.entries(planDeletes)) {
+      const key = String(id ?? "").trim()
+      if (!key || !entry) continue
+      nextPendingDeletes[key] = {
+        deletedAt: entry.deletedAt || new Date().toISOString(),
+        expiresAt: now + DURABLE_REMOTE_WRITE_TTL_MS
+      }
+      delete nextPendingWrites[key]
+    }
+    pendingPlanWritesRef.current = nextPendingWrites
+    pendingPlanDeletesRef.current = nextPendingDeletes
+
+    const deleteIds = new Set(Object.keys(planDeletes).map((id) => String(id ?? "").trim()).filter(Boolean))
+    const writeRows = Object.values(planWrites)
+      .map((entry) => entry?.row)
+      .filter((row) => row && String(row?.id ?? "").trim())
+    if (deleteIds.size > 0 || writeRows.length > 0) {
+      setPlans((prev) => {
+        const base = (prev ?? []).filter((row) => !deleteIds.has(String(row?.id ?? "").trim()))
+        const next = mergeRowsById(base, writeRows)
+        plansRef.current = next
+        schedulePlansCachePersist(normalizedUserId, next)
+        return next
+      })
+    }
+
+    const memoOverlay = {}
+    for (const [id, entry] of Object.entries(rightMemoWrites)) {
+      const key = String(id ?? "").trim()
+      if (!key || key === "all") continue
+      memoOverlay[key] = String(entry?.content ?? "")
+    }
+    if (Object.keys(memoOverlay).length > 0) {
+      pendingRightMemoWritesRef.current = {
+        ...(pendingRightMemoWritesRef.current ?? {}),
+        ...Object.fromEntries(
+          Object.entries(memoOverlay).map(([id, value]) => [
+            id,
+            { value, expiresAt: now + DURABLE_REMOTE_WRITE_TTL_MS }
+          ])
+        )
+      }
+      setRightMemos((prev) => {
+        const next = { ...(prev ?? {}), ...memoOverlay }
+        rightMemosRef.current = next
+        persistRightMemosCache(normalizedUserId, memoYear, next).catch(() => {})
+        return next
+      })
+    }
+  }
+
+  async function hydrateDurableRemoteQueue(userId) {
+    const normalizedUserId = String(userId ?? "").trim()
+    if (!normalizedUserId || durableQueueLoadedUserRef.current === normalizedUserId) return
+    durableQueueLoadedUserRef.current = normalizedUserId
+    try {
+      const raw = await AsyncStorage.getItem(pendingRemoteQueueStorageKey(normalizedUserId))
+      const parsed = raw ? JSON.parse(raw) : {}
+      const queue = normalizeDurableRemoteQueue(parsed)
+      durablePlanWritesRef.current = queue.planWrites
+      durablePlanDeletesRef.current = queue.planDeletes
+      durableRightMemoWritesRef.current = queue.rightMemoWrites
+      applyDurableRemoteQueueOverlay(normalizedUserId)
+      if (getDurableRemoteQueueCount() > 0) scheduleDurableRemoteQueueFlush(normalizedUserId, 900)
+    } catch (_e) {
+      durablePlanWritesRef.current = {}
+      durablePlanDeletesRef.current = {}
+      durableRightMemoWritesRef.current = {}
+    }
+  }
+
+  function getExpectedQueuedAt(expectedMap, id) {
+    if (!expectedMap || typeof expectedMap !== "object") return null
+    const value = expectedMap[String(id ?? "").trim()]
+    const numeric = Number(value)
+    return Number.isFinite(numeric) && numeric > 0 ? numeric : null
+  }
+
+  function markDurablePlanRows(userId, rows) {
+    const normalizedUserId = String(userId ?? "").trim()
+    const list = Array.isArray(rows) ? rows.filter((row) => row && String(row?.id ?? "").trim()) : []
+    if (!normalizedUserId || list.length === 0) return {}
+    const now = Date.now()
+    const versions = {}
+    const nextWrites = { ...(durablePlanWritesRef.current ?? {}) }
+    const nextDeletes = { ...(durablePlanDeletesRef.current ?? {}) }
+    list.forEach((row, idx) => {
+      const id = String(row?.id ?? "").trim()
+      if (!id) return
+      const queuedAt = now + idx
+      nextWrites[id] = {
+        row: { ...(row ?? {}), id, user_id: String(row?.user_id ?? normalizedUserId).trim() || normalizedUserId },
+        queuedAt
+      }
+      delete nextDeletes[id]
+      versions[id] = queuedAt
+    })
+    durablePlanWritesRef.current = nextWrites
+    durablePlanDeletesRef.current = nextDeletes
+    scheduleDurableRemoteQueuePersist(normalizedUserId)
+    scheduleDurableRemoteQueueFlush(normalizedUserId)
+    return versions
+  }
+
+  function clearDurablePlanWrites(userId, ids, expectedQueuedAtById = null) {
+    const normalizedUserId = String(userId ?? "").trim()
+    const normalizedIds = [...new Set((ids ?? []).map((id) => String(id ?? "").trim()).filter(Boolean))]
+    if (!normalizedUserId || normalizedIds.length === 0) return
+    const nextWrites = { ...(durablePlanWritesRef.current ?? {}) }
+    let changed = false
+    for (const id of normalizedIds) {
+      const expectedQueuedAt = getExpectedQueuedAt(expectedQueuedAtById, id)
+      if (expectedQueuedAt && Number(nextWrites?.[id]?.queuedAt ?? 0) !== expectedQueuedAt) continue
+      if (!Object.prototype.hasOwnProperty.call(nextWrites, id)) continue
+      delete nextWrites[id]
+      changed = true
+    }
+    if (!changed) return
+    durablePlanWritesRef.current = nextWrites
+    scheduleDurableRemoteQueuePersist(normalizedUserId, 0)
+  }
+
+  function markDurablePlanDeletes(userId, ids, deletedAt = new Date().toISOString()) {
+    const normalizedUserId = String(userId ?? "").trim()
+    const normalizedIds = [...new Set((ids ?? []).map((id) => String(id ?? "").trim()).filter(Boolean))]
+    if (!normalizedUserId || normalizedIds.length === 0) return {}
+    const now = Date.now()
+    const versions = {}
+    const nextDeletes = { ...(durablePlanDeletesRef.current ?? {}) }
+    const nextWrites = { ...(durablePlanWritesRef.current ?? {}) }
+    normalizedIds.forEach((id, idx) => {
+      const queuedAt = now + idx
+      nextDeletes[id] = { deletedAt, queuedAt }
+      delete nextWrites[id]
+      versions[id] = queuedAt
+    })
+    durablePlanDeletesRef.current = nextDeletes
+    durablePlanWritesRef.current = nextWrites
+    scheduleDurableRemoteQueuePersist(normalizedUserId)
+    scheduleDurableRemoteQueueFlush(normalizedUserId)
+    return versions
+  }
+
+  function clearDurablePlanDeletes(userId, ids, expectedQueuedAtById = null) {
+    const normalizedUserId = String(userId ?? "").trim()
+    const normalizedIds = [...new Set((ids ?? []).map((id) => String(id ?? "").trim()).filter(Boolean))]
+    if (!normalizedUserId || normalizedIds.length === 0) return
+    const nextDeletes = { ...(durablePlanDeletesRef.current ?? {}) }
+    let changed = false
+    for (const id of normalizedIds) {
+      const expectedQueuedAt = getExpectedQueuedAt(expectedQueuedAtById, id)
+      if (expectedQueuedAt && Number(nextDeletes?.[id]?.queuedAt ?? 0) !== expectedQueuedAt) continue
+      if (!Object.prototype.hasOwnProperty.call(nextDeletes, id)) continue
+      delete nextDeletes[id]
+      changed = true
+    }
+    if (!changed) return
+    durablePlanDeletesRef.current = nextDeletes
+    scheduleDurableRemoteQueuePersist(normalizedUserId, 0)
+  }
+
+  function markDurableRightMemoWrite(userId, windowId, year, content) {
+    const normalizedUserId = String(userId ?? "").trim()
+    const id = String(windowId ?? "").trim()
+    if (!normalizedUserId || !id || id === "all") return null
+    const queuedAt = Date.now()
+    durableRightMemoWritesRef.current = {
+      ...(durableRightMemoWritesRef.current ?? {}),
+      [id]: {
+        year: Number(year) || memoYear,
+        content: String(content ?? ""),
+        queuedAt
+      }
+    }
+    scheduleDurableRemoteQueuePersist(normalizedUserId)
+    scheduleDurableRemoteQueueFlush(normalizedUserId)
+    return queuedAt
+  }
+
+  function clearDurableRightMemoWrite(userId, windowId, expectedQueuedAt = null) {
+    const normalizedUserId = String(userId ?? "").trim()
+    const id = String(windowId ?? "").trim()
+    if (!normalizedUserId || !id) return
+    const nextWrites = { ...(durableRightMemoWritesRef.current ?? {}) }
+    const expected = Number(expectedQueuedAt)
+    if (Number.isFinite(expected) && expected > 0 && Number(nextWrites?.[id]?.queuedAt ?? 0) !== expected) return
+    if (!Object.prototype.hasOwnProperty.call(nextWrites, id)) return
+    delete nextWrites[id]
+    durableRightMemoWritesRef.current = nextWrites
+    scheduleDurableRemoteQueuePersist(normalizedUserId, 0)
+  }
+
+  async function upsertDurablePlanRows(rows) {
+    let payloads = (Array.isArray(rows) ? rows : [])
+      .map((row) => ({ ...(row ?? {}), id: String(row?.id ?? "").trim() }))
+      .filter((row) => row.id)
+    if (payloads.length === 0) return
+    let { error } = await supabase.from("plans").upsert(payloads, { onConflict: "id" })
+    if (error && isRepeatColumnError(error)) {
+      markRepeatFallbackNotice()
+      payloads = payloads.map((row) => stripRepeatColumns(row))
+      const retry = await supabase.from("plans").upsert(payloads, { onConflict: "id" })
+      error = retry.error
+    }
+    if (error && isEndTimeColumnError(error)) {
+      markEndTimeFallbackNotice()
+      payloads = stripEndTimeFromRows(payloads)
+      const retry = await supabase.from("plans").upsert(payloads, { onConflict: "id" })
+      error = retry.error
+    }
+    if (error && isSortOrderColumnError(error)) {
+      markSortOrderFallbackNotice()
+      payloads = stripSortOrderFromRows(payloads)
+      const retry = await supabase.from("plans").upsert(payloads, { onConflict: "id" })
+      error = retry.error
+    }
+    if (error) throw error
+  }
+
+  async function upsertDurableRightMemoWrite(userId, windowId, entry) {
+    const normalizedUserId = String(userId ?? "").trim()
+    const id = String(windowId ?? "").trim()
+    if (!normalizedUserId || !id || id === "all") return
+    const basePayload = {
+      user_id: normalizedUserId,
+      year: Number(entry?.year) || memoYear,
+      window_id: id,
+      content: String(entry?.content ?? "")
+    }
+    let error = null
+    if (rightMemoMetaColumnsSupportedRef.current) {
+      const result = await supabase.from("right_memos").upsert(
+        {
+          ...basePayload,
+          updated_at: new Date().toISOString(),
+          client_id: clientId || null
+        },
+        { onConflict: "user_id,year,window_id" }
+      )
+      error = result?.error ?? null
+      if (error && isRightMemoMetaColumnError(error)) {
+        rightMemoMetaColumnsSupportedRef.current = false
+        error = null
+      }
+    }
+    if (!error && !rightMemoMetaColumnsSupportedRef.current) {
+      const result = await supabase.from("right_memos").upsert(basePayload, {
+        onConflict: "user_id,year,window_id"
+      })
+      error = result?.error ?? null
+    }
+    if (error) throw error
+  }
+
+  function scheduleDurableRemoteQueueFlush(userId, delay = DURABLE_REMOTE_QUEUE_RETRY_MS) {
+    const normalizedUserId = String(userId ?? "").trim()
+    if (!normalizedUserId || !supabase) return
+    if (durableQueueFlushTimerRef.current) clearTimeout(durableQueueFlushTimerRef.current)
+    durableQueueFlushTimerRef.current = setTimeout(() => {
+      durableQueueFlushTimerRef.current = null
+      flushDurableRemoteQueue(normalizedUserId).catch(() => {})
+    }, Math.max(0, Number(delay) || 0))
+  }
+
+  async function flushDurableRemoteQueue(userId) {
+    const normalizedUserId = String(userId ?? "").trim()
+    if (!supabase || !normalizedUserId || durableQueueFlushingRef.current) return
+    if (durableQueueLoadedUserRef.current !== normalizedUserId) {
+      await hydrateDurableRemoteQueue(normalizedUserId)
+    }
+    if (getDurableRemoteQueueCount() === 0) return
+    durableQueueFlushingRef.current = true
+    let failed = false
+    try {
+      const deleteEntries = Object.entries(durablePlanDeletesRef.current ?? {})
+        .map(([id, entry]) => [String(id ?? "").trim(), entry])
+        .filter(([id, entry]) => id && entry)
+      if (deleteEntries.length > 0) {
+        try {
+          const deletedAt = new Date().toISOString()
+          await softDeletePlansByIds(
+            normalizedUserId,
+            deleteEntries.map(([id]) => id),
+            deleteEntries[0]?.[1]?.deletedAt || deletedAt
+          )
+          clearDurablePlanDeletes(
+            normalizedUserId,
+            deleteEntries.map(([id]) => id),
+            Object.fromEntries(deleteEntries.map(([id, entry]) => [id, entry?.queuedAt]))
+          )
+        } catch (_e) {
+          failed = true
+        }
+      }
+
+      const writeEntries = Object.entries(durablePlanWritesRef.current ?? {})
+        .map(([id, entry]) => [String(id ?? "").trim(), entry])
+        .filter(([id, entry]) => id && entry?.row)
+        .sort((a, b) => Number(a?.[1]?.queuedAt ?? 0) - Number(b?.[1]?.queuedAt ?? 0))
+      if (writeEntries.length > 0) {
+        try {
+          const rows = writeEntries.map(([id, entry]) => ({
+            ...(entry?.row ?? {}),
+            id,
+            user_id: String(entry?.row?.user_id ?? normalizedUserId).trim() || normalizedUserId
+          }))
+          await upsertDurablePlanRows(rows)
+          clearDurablePlanWrites(
+            normalizedUserId,
+            writeEntries.map(([id]) => id),
+            Object.fromEntries(writeEntries.map(([id, entry]) => [id, entry?.queuedAt]))
+          )
+        } catch (_e) {
+          failed = true
+        }
+      }
+
+      const memoEntries = Object.entries(durableRightMemoWritesRef.current ?? {})
+        .map(([id, entry]) => [String(id ?? "").trim(), entry])
+        .filter(([id, entry]) => id && id !== "all" && entry)
+      for (const [id, entry] of memoEntries) {
+        try {
+          await upsertDurableRightMemoWrite(normalizedUserId, id, entry)
+          clearDurableRightMemoWrite(normalizedUserId, id, entry?.queuedAt)
+        } catch (_e) {
+          failed = true
+        }
+      }
+      await persistDurableRemoteQueue(normalizedUserId)
+      if (getDurableRemoteQueueCount() > 0 || failed) {
+        scheduleDurableRemoteQueueFlush(normalizedUserId)
+      } else {
+        loadPlans(normalizedUserId, { silent: true }).catch(() => {})
+        loadRightMemos(normalizedUserId, memoYear).catch(() => {})
+      }
+    } finally {
+      durableQueueFlushingRef.current = false
     }
   }
 
@@ -10067,7 +10490,8 @@ function AppInner() {
 
   function stagePlanDeletes(userId, ids, deletedAt = new Date().toISOString()) {
     const normalized = [...new Set((ids ?? []).map((id) => String(id ?? "").trim()).filter(Boolean))]
-    if (normalized.length === 0) return
+    if (normalized.length === 0) return {}
+    const durableVersions = markDurablePlanDeletes(userId, normalized, deletedAt)
     const now = Date.now()
     const idSet = new Set(normalized)
     const pendingDeletes = { ...(pendingPlanDeletesRef.current ?? {}) }
@@ -10084,6 +10508,7 @@ function AppInner() {
       schedulePlansCachePersist(userId, next)
       return next
     })
+    return durableVersions
   }
 
   function shouldIgnoreDuplicateTaskToggle(rowId, source = "default") {
@@ -10845,10 +11270,13 @@ function AppInner() {
 
   useEffect(() => {
     if (!supabase || !session?.user?.id) return
-    hydrateCachedPlannerState(session.user.id).catch(() => {})
-    loadPlans(session.user.id)
-    loadWindows(session.user.id)
-    loadRightMemos(session.user.id, memoYear)
+    ;(async () => {
+      await hydrateCachedPlannerState(session.user.id)
+      await hydrateDurableRemoteQueue(session.user.id)
+      loadPlans(session.user.id)
+      loadWindows(session.user.id)
+      loadRightMemos(session.user.id, memoYear)
+    })().catch(() => {})
   }, [session?.user?.id])
 
   useEffect(() => {
@@ -10860,9 +11288,11 @@ function AppInner() {
       const becameActive = prevState.match(/inactive|background/) && nextState === "active"
       if (nextState !== "active") {
         flushPendingTaskToggleCommits()
+        persistDurableRemoteQueue(userId).catch(() => {})
         return
       }
       if (!becameActive) return
+      flushDurableRemoteQueue(userId).catch(() => {})
       requestPlanNotificationSync(userId, plansRef.current, { force: true })
       loadPlans(userId, { silent: true }).catch(() => {})
       loadWindows(userId).catch(() => {})
@@ -11229,6 +11659,7 @@ function AppInner() {
     const id = String(windowId ?? "").trim()
     if (!id || id === "all") return
     const text = String(content ?? "")
+    markDurableRightMemoWrite(session?.user?.id, id, memoYear, text)
     pendingRightMemoWritesRef.current = {
       ...(pendingRightMemoWritesRef.current ?? {}),
       [id]: { value: text, expiresAt: Date.now() + PENDING_REMOTE_WRITE_TTL_MS }
@@ -11248,6 +11679,7 @@ function AppInner() {
     if (!id || id === "all") return
     const text = String(content ?? "")
     stageRightMemoWrite(id, text)
+    const durableQueuedAt = Number(durableRightMemoWritesRef.current?.[id]?.queuedAt ?? 0) || null
     const nextSeq = (Number(rightMemoWriteSeqRef.current?.[id]) || 0) + 1
     rightMemoWriteSeqRef.current = { ...(rightMemoWriteSeqRef.current ?? {}), [id]: nextSeq }
 
@@ -11295,6 +11727,7 @@ function AppInner() {
           delete pending[id]
           pendingRightMemoWritesRef.current = pending
         }
+        clearDurableRightMemoWrite(userId, id, durableQueuedAt)
         await persistRightMemosCache(userId, memoYear, { ...(rightMemosRef.current ?? {}), [id]: text })
       }
     }
@@ -11664,6 +12097,7 @@ function isRightMemoMetaColumnError(error) {
       }))
       const stagedIds = insertChunk.map((row) => String(row?.id ?? "").trim()).filter(Boolean)
       stagePlanRows(userId, insertChunk)
+      const durableVersions = markDurablePlanRows(userId, insertChunk)
       let data = null
       let error = null
       try {
@@ -11693,11 +12127,11 @@ function isRightMemoMetaColumnError(error) {
         }
         if (error) throw error
       } catch (errorToThrow) {
-        clearPendingPlanWrites(stagedIds)
-        loadPlans(userId, { silent: true }).catch(() => {})
+        scheduleDurableRemoteQueueFlush(userId)
         throw errorToThrow
       }
       if ((data ?? []).length > 0) stagePlanRows(userId, data)
+      clearDurablePlanWrites(userId, stagedIds, durableVersions)
       for (const row of data ?? insertChunk) {
         const id = String(row?.id ?? "").trim()
         if (id) insertedIds.push(id)
@@ -11708,6 +12142,7 @@ function isRightMemoMetaColumnError(error) {
 
   async function updatePlanRow(userId, id, payload, options = {}) {
     const shouldStage = options?.stage !== false
+    const durableVersions = markDurablePlanRows(userId, [{ id, user_id: userId, ...(payload ?? {}) }])
     if (shouldStage) {
       stagePlanRows(userId, [{ id, user_id: userId, ...(payload ?? {}) }])
     }
@@ -11736,6 +12171,7 @@ function isRightMemoMetaColumnError(error) {
     planWriteQueueRef.current = { ...(planWriteQueueRef.current ?? {}), [rowId]: writePromise }
     try {
       await writePromise
+      clearDurablePlanWrites(userId, [rowId], durableVersions)
     } finally {
       if (planWriteQueueRef.current?.[rowId] === writePromise) {
         const nextQueue = { ...(planWriteQueueRef.current ?? {}) }
@@ -11812,6 +12248,7 @@ function isRightMemoMetaColumnError(error) {
 
     if (payloads.length === 0) return
     stagePlanRows(userId, payloads)
+    const durableVersions = markDurablePlanRows(userId, payloads)
 
     const runOrderUpdate = async () => {
       if (sortOrderSupportedRef.current) {
@@ -11840,6 +12277,7 @@ function isRightMemoMetaColumnError(error) {
     const writePromise = planOrderWriteQueueRef.current.catch(() => {}).then(runOrderUpdate)
     planOrderWriteQueueRef.current = writePromise
     await writePromise
+    clearDurablePlanWrites(userId, payloads.map((row) => row.id), durableVersions)
   }
 
   function applyLegacySeriesMatch(query, target, { futureOnly = false } = {}) {
@@ -12029,8 +12467,9 @@ function isRightMemoMetaColumnError(error) {
               })
               .map((row) => String(row?.id ?? "").trim())
           )
+          let localRegenerateDeleteVersions = {}
           if (localRegenerateDeleteIds.size > 0) {
-            stagePlanDeletes(userId, [...localRegenerateDeleteIds], deletedAt)
+            localRegenerateDeleteVersions = stagePlanDeletes(userId, [...localRegenerateDeleteIds], deletedAt)
           }
           if (sourceSeriesId && repeatColumnsSupportedRef.current) {
             let query = supabase
@@ -12067,6 +12506,7 @@ function isRightMemoMetaColumnError(error) {
             await softDeletePlansByIds(userId, legacyDeleteIds, deletedAt)
           }
           clearPendingPlanDeletes([...localRegenerateDeleteIds])
+          clearDurablePlanDeletes(userId, [...localRegenerateDeleteIds], localRegenerateDeleteVersions)
           deletedBeforeInsert = true
         }
 
@@ -12111,7 +12551,7 @@ function isRightMemoMetaColumnError(error) {
     } catch (error) {
       const message = error?.message || "Save failed."
       setAuthMessage(message)
-      loadPlans(userId, { silent: true }).catch(() => {})
+      scheduleDurableRemoteQueueFlush(userId, 1200)
       Alert.alert("저장 실패", message)
       return false
     }
@@ -12161,8 +12601,8 @@ function isRightMemoMetaColumnError(error) {
       await updatePlanSortOrders(userId, updates, baseMs)
     } catch (error) {
       const message = error?.message || "Save failed."
-      Alert.alert("정렬 저장 실패", message)
-      await loadPlans(userId)
+      setAuthMessage(message)
+      scheduleDurableRemoteQueueFlush(userId, 1200)
     }
   }
 
@@ -12292,8 +12732,8 @@ function isRightMemoMetaColumnError(error) {
       )
     } catch (error) {
       const message = error?.message || "Save failed."
-      Alert.alert("이동 저장 실패", message)
-      await loadPlans(userId)
+      setAuthMessage(message)
+      scheduleDurableRemoteQueueFlush(userId, 1200)
     }
   }
 
@@ -12302,6 +12742,7 @@ function isRightMemoMetaColumnError(error) {
     if (!supabase || !userId || !nextTarget?.id) return false
 
     let stagedDeleteIds = []
+    let stagedDeleteVersions = {}
     try {
       const deletedAt = new Date().toISOString()
       const scope = String(nextTarget?.delete_scope ?? "single")
@@ -12326,7 +12767,7 @@ function isRightMemoMetaColumnError(error) {
       )
       localDeleteIds.add(String(nextTarget.id))
       stagedDeleteIds = [...localDeleteIds]
-      stagePlanDeletes(userId, stagedDeleteIds, deletedAt)
+      stagedDeleteVersions = stagePlanDeletes(userId, stagedDeleteIds, deletedAt)
 
       let query = supabase
         .from("plans")
@@ -12366,11 +12807,11 @@ function isRightMemoMetaColumnError(error) {
       }
 
       clearPendingPlanDeletes(stagedDeleteIds)
+      clearDurablePlanDeletes(userId, stagedDeleteIds, stagedDeleteVersions)
       loadPlans(userId, { silent: true }).catch(() => {})
       return true
     } catch (error) {
-      clearPendingPlanDeletes(stagedDeleteIds)
-      loadPlans(userId, { silent: true }).catch(() => {})
+      scheduleDurableRemoteQueueFlush(userId)
       setAuthMessage(error?.message || "Delete failed.")
       return false
     }
@@ -12700,6 +13141,7 @@ function isRightMemoMetaColumnError(error) {
     taskToggleSeqRef.current = { ...(taskToggleSeqRef.current ?? {}), [rowId]: nextSeq }
     setTaskCompletionOverrides((prev) => ({ ...(prev ?? {}), [rowId]: nextCompleted }))
     stagePlanRowsSilently([nextRow])
+    markDurablePlanRows(userId, [nextRow])
 
     const existingCommit = taskToggleCommitTimersRef.current?.[rowId]
     if (existingCommit?.timer) clearTimeout(existingCommit.timer)
@@ -12744,15 +13186,9 @@ function isRightMemoMetaColumnError(error) {
         })
         .catch((error) => {
           if (taskToggleSeqRef.current?.[rowId] !== nextSeq) return
-          clearPendingPlanWrites([rowId])
-          setTaskCompletionOverrides((prev) => {
-            if (!prev || !Object.prototype.hasOwnProperty.call(prev, rowId)) return prev
-            const next = { ...prev }
-            delete next[rowId]
-            return next
-          })
-          Alert.alert("Task 저장 실패", error?.message || "상태 변경에 실패했습니다.")
-          loadPlans(userId).catch(() => {})
+          setAuthMessageTone("error")
+          setAuthMessage(error?.message || "체크 변경 저장을 다시 시도하고 있어요.")
+          scheduleDurableRemoteQueueFlush(userId, 1200)
         })
         .finally(() => {
           if (taskToggleWriteQueueRef.current?.[rowId] === writePromise) {
